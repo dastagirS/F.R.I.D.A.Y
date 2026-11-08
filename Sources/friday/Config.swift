@@ -7,6 +7,7 @@ struct FridayConfig: Codable {
   var defaultGeneration: String?
   var pace: Int?
   var expressivity: Int?
+  var sentenceChunking: Bool?
 
   static var fileURL: URL {
     if let override = ProcessInfo.processInfo.environment["FRIDAY_CONFIG"], !override.isEmpty {
@@ -36,6 +37,11 @@ struct FridayConfig: Codable {
   // The built-in lock-in, used when neither flags nor the config file decide.
   static let builtInVoice = "simone"
   static let builtInGeneration = "standard"
+
+  // On by default: per-sentence requests materially raise the odds of the daemon's
+  // lossless encoder and lower time-to-first-word on long answers. It is a bias,
+  // not a guarantee; the codec stays the daemon's choice either way.
+  static let builtInSentenceChunking = true
 
   static func normalizeGeneration(_ raw: String) -> String? {
     switch raw.lowercased() {

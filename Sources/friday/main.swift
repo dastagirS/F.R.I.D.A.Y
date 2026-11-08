@@ -18,11 +18,13 @@ struct SpeakOptions {
   var timingsToStdout = false
   var timingsPath: String?
   var prewarm = false
+  var chunked: Bool?
   var listVoices = false
   var quiet = false
   var showHelp = false
   var completionsShell: String?
   var showMan = false
+  var showSkill = false
 }
 
 func parseSpeakOptions(_ arguments: [String]) throws -> SpeakOptions {
@@ -51,9 +53,12 @@ func parseSpeakOptions(_ arguments: [String]) throws -> SpeakOptions {
     case "--timings": options.timingsToStdout = true
     case "--timings-out": options.timingsPath = iterator.next()
     case "--prewarm": options.prewarm = true
+    case "--chunked": options.chunked = true
+    case "--no-chunked": options.chunked = false
     case "-q", "--quiet": options.quiet = true
     case "--completions": options.completionsShell = iterator.next()
     case "--man": options.showMan = true
+    case "--skill": options.showSkill = true
     case "--": while let rest = iterator.next() { positionals.append(rest) }
     default: positionals.append(argument)
     }
@@ -94,6 +99,10 @@ func runSpeak(_ arguments: [String], config: FridayConfig) throws {
     print(manPage)
     return
   }
+  if options.showSkill {
+    print(skillText)
+    return
+  }
 
   let catalog = try VoiceCatalog.open()
   if options.listVoices {
@@ -113,6 +122,7 @@ func runSpeak(_ arguments: [String], config: FridayConfig) throws {
     voiceWasExplicit: voiceWasExplicit,
     usingBuiltInDefault: usingBuiltInDefault
   )
+  let chunkSentences = options.chunked ?? config.sentenceChunking ?? FridayConfig.builtInSentenceChunking
   let pace = options.pace ?? config.pace ?? 3
   let expressivity = options.expressivity ?? config.expressivity ?? 3
   let synthesizer = Synthesizer(catalog: catalog)
@@ -146,7 +156,8 @@ func runSpeak(_ arguments: [String], config: FridayConfig) throws {
     pitch: options.pitch,
     volume: options.volume,
     wantsTimings: wantsTimings,
-    playback: options.outputPath == nil
+    playback: options.outputPath == nil,
+    chunkSentences: chunkSentences
   )
 
   if let outputPath = options.outputPath {
@@ -176,11 +187,15 @@ func runSpeak(_ arguments: [String], config: FridayConfig) throws {
   if !options.quiet {
     let generationLabel = generation == "expressive" ? "expressive pace\(pace) expressivity\(expressivity)" : "standard"
     let timingsLabel = outcome.timings.timingsSupported ? " timings=\(outcome.timings.timings.count)" : ""
+    let chunkLabel = outcome.chunkCount > 1 ? " chunks=\(outcome.chunkCount)" : ""
+    // The daemon alternates lossless PCM and ~50 kbps Opus on its own; say which
+    // one happened instead of letting the difference reach the ear unexplained.
+    let codecLabel = outcome.sourceFormat.contains("opus") ? " codec=lossy" : ""
     FileHandle.standardError.write(String(
-      format: "voice=%@ [%@] %@ src=%@ first_audio=%.0fms synthesis=%.2fs audio=%.2fs%@\n",
+      format: "voice=%@ [%@] %@ src=%@ first_audio=%.0fms synthesis=%.2fs audio=%.2fs%@%@%@\n",
       outcome.voiceName as NSString, outcome.language as NSString, generationLabel as NSString,
       outcome.sourceFormat as NSString, outcome.firstAudioMilliseconds, outcome.synthesisSeconds,
-      outcome.audioSeconds, timingsLabel as NSString
+      outcome.audioSeconds, chunkLabel as NSString, codecLabel as NSString, timingsLabel as NSString
     ).data(using: .utf8)!)
   }
 }

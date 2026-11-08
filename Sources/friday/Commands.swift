@@ -238,6 +238,8 @@ func runConfig(_ arguments: [String], config: FridayConfig) throws {
     print("default-generation\t\(updated.defaultGeneration ?? "standard (built-in)")")
     print("pace\t\(updated.pace.map(String.init) ?? "3 (built-in)")")
     print("expressivity\t\(updated.expressivity.map(String.init) ?? "3 (built-in)")")
+    let chunking = updated.sentenceChunking ?? FridayConfig.builtInSentenceChunking
+    print("sentence-chunking\t\(chunking ? "on" : "off")\(updated.sentenceChunking == nil ? " (built-in)" : "")")
 
   case "set":
     guard verbs.count >= 3 else { throw FridayError.usage("config set needs a key and a value") }
@@ -261,6 +263,12 @@ func runConfig(_ arguments: [String], config: FridayConfig) throws {
       }
       updated.defaultGeneration = normalized
       try save()
+    case "sentence-chunking":
+      guard let parsed = parseOnOff(value) else {
+        throw FridayError.usage("sentence-chunking must be on or off")
+      }
+      updated.sentenceChunking = parsed
+      try save()
     case "pace", "expressivity":
       guard let number = Int(value), (1...5).contains(number) else {
         throw FridayError.usage("\(key) must be 1 through 5")
@@ -268,7 +276,7 @@ func runConfig(_ arguments: [String], config: FridayConfig) throws {
       if key == "pace" { updated.pace = number } else { updated.expressivity = number }
       try save()
     default:
-      throw FridayError.usage("unknown key '\(key)'; use default-voice, default-generation, pace, expressivity")
+      throw FridayError.usage("unknown key '\(key)'; use default-voice, default-generation, sentence-chunking, pace, expressivity")
     }
 
   case "unset":
@@ -279,6 +287,7 @@ func runConfig(_ arguments: [String], config: FridayConfig) throws {
       // default-generation was derived from the voice that chose it, so it goes too.
       updated.defaultGeneration = nil
     case "default-generation": updated.defaultGeneration = nil
+    case "sentence-chunking": updated.sentenceChunking = nil
     case "pace": updated.pace = nil
     case "expressivity": updated.expressivity = nil
     default: throw FridayError.usage("unknown key '\(verbs[1])'")

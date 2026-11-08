@@ -8,6 +8,7 @@ friday "Say this out loud"
 echo "$REPLY" | friday -q -            # for a voice loop
 friday -o line.wav "render to a file"
 friday voices                          # installed voices and their asset path
+friday --skill                         # agent skill file: capabilities, limits, exit codes
 ```
 
 Installed as a symlink: `/opt/homebrew/bin/friday`.
@@ -23,6 +24,7 @@ friday config                                    # show effective settings
 friday config set default-voice simone --standard
 friday config set default-generation expressive
 friday config set pace 2
+friday config set sentence-chunking off
 friday config unset default-voice                # also clears the derived generation
 friday config reset
 ```
@@ -40,7 +42,12 @@ friday voices [--status NAME | --install NAME --language xx [--wait] | --manage 
 friday config [set KEY VALUE | unset KEY | reset]
 friday --completions zsh|bash|fish
 friday --man
+friday --skill
 ```
+
+`--skill` prints the agent-facing contract: what friday can do, how to call it,
+which flags matter, and which paths are unverified. It is embedded in the binary
+so it cannot drift from the installed build.
 
 `serve` also solves cold start: one process holds one `DaemonSession`, so every
 request is warm (measured 47–72 ms to first audio versus ~0.5 s per CLI call).
@@ -58,6 +65,46 @@ GET  /healthz                               {status, voices, defaultVoice, uptim
 
 `--auth-token-env VAR` requires `Authorization: Bearer $VAR` on every route.
 Responses carry `X-Friday-Voice`, `X-Friday-Generation`, `X-Friday-Source`.
+
+## Sentence chunking
+
+On by default, and the measurements behind it are worth knowing exactly, because
+they are messier than they first looked.
+
+`sirittsd` picks its encoder per request and offers no control over it:
+
+| observation | result |
+|---|---|
+| same text, repeated while the daemon is hot | `lpcm` 48 kHz — lossless |
+| same text, after ~20 s idle | `opus` 48 kHz — about 50 kbps, lossy |
+| four-sentence paragraph as one request | `opus`, 6 attempts out of 6 |
+| the same paragraph as four requests | `lpcm`, 4 out of 4 |
+
+Both encodings decode to the same number of samples for the same text, so this is
+transport, not a different voice or model. `simone` and `Simone` even render
+byte-identical audio, and `disableCompactVoice`, `forceOspreyTTS`,
+`synthesisProfile` and `synthesisPriority` change nothing. At ~50 kbps the voice
+sounds thinner, which is what was heard first and measured second.
+
+So `friday` sends one sentence per request by default: small requests land on the
+lossless encoder far more often, and the first word plays while later sentences
+are still rendering. This is a bias, not a guarantee — the daemon can answer
+lossy anyway, and it does so silently. `src=` shows the real format and
+`codec=lossy` appears on stderr when it happened, so trust the output rather than
+the expectation. The cost is a little cross-sentence prosody.
+
+```bash
+friday --chunked "default"        # explicit
+friday --no-chunked "one request" # the old behaviour: lossy above one sentence
+friday config set sentence-chunking off
+```
+
+Splitting is deliberately conservative: a boundary needs whitespace after the
+terminator, so `18.5`, `a.m.`, `v2.0` stay whole; `Dr.`, `Mr.`, `e.g.`, `U.S.`
+are guarded; quoted endings such as `"stop."` travel with their sentence. Word
+timings are rebased onto the original text and the global timeline, so they stay
+correct across chunks. Splitting stops at 200 chunks or 20,000 characters and
+falls back to a single request.
 
 ## Word timings
 
@@ -90,9 +137,10 @@ The daemon returns audio in **three** shapes and chooses on its own:
 
 | source | when | note |
 |---|---|---|
-| `lpcm` 16-bit int | standard path | 22.05–48 kHz |
+| `lpcm` 16-bit int | standard path, single sentence | 22.05–48 kHz |
 | `lpcm` 32-bit float | expressive, short text | 24 kHz |
-| `opus` packets | expressive, longer text | 48 kHz, needs real decoding |
+| `opus` packets | standard path, multi-sentence | 48 kHz, ~50 kbps, lossy |
+| `opus` packets | expressive, longer text | 48 kHz, 960 frames per packet |
 
 Everything is normalised to 48 kHz float mono by `ChunkDecoder` before playback
 or writing. Skipping that is what makes output sound shredded: float bytes under
@@ -139,6 +187,7 @@ Sources/friday/Synthesizer.swift one synthesis path for CLI, prewarm and server
 Sources/friday/Decoder.swift     Opus / float / int → 48 kHz float mono
 Sources/friday/Speaker.swift     streaming playback, stop, drain
 Sources/friday/Timings.swift     word timing assembly + JSON
+Sources/friday/TextChunker.swift sentence splitting for the lossless path
 Sources/friday/HTTPServer.swift  POSIX sockets, no dependencies
 Sources/friday/Commands.swift    serve / voices / config
 Sources/friday/Help.swift        usage, completion scripts, man page
@@ -150,9 +199,12 @@ Sources/friday/Util.swift        errors, WAV encoding, run-loop pump
 Exercised end to end on macOS 27.2: CLI defaults and overrides, word timings
 (including a 44-word sentence, which previously lost 28 words), timings to file,
 prewarm, all config verbs, voice list/status/available/default, purge dry-run,
-ambiguity and unknown-voice refusals, completion scripts, man page, exit codes,
-and every HTTP route including bearer auth. Audio correctness is checked by
-amplitude (peak/rms) rather than by ear.
+ambiguity and unknown-voice refusals, completion scripts (zsh and bash pass their
+own syntax checkers), man page, skill file, exit codes, and every HTTP route
+including bearer auth. Sentence splitting is checked against seven boundary
+cases (abbreviations, decimals, quoted endings, ellipsis, no terminator), and
+timings are verified to map back onto the original text after chunking. Audio
+correctness is checked by amplitude (peak/rms) rather than by ear.
 
 Not verified, deliberately or unavoidably:
 
@@ -164,7 +216,11 @@ Not verified, deliberately or unavoidably:
   bundle.
 - **`/stop` preempting an in-flight synthesis** — the server is single-threaded
   on the main run loop (required by `sirittsd`), so `/stop` is queued behind the
-  request it would cancel. CLI Ctrl-C barge-in does work: exit 130 in 0.73 s.
+  request it would cancel. CLI Ctrl-C barge-in does work: exit 130 in 0.73 s,
+  including during playback drain after chunked synthesis has finished.
+- **Clipping on a loud voice.** `nora` on the standard path renders 1.17% of samples
+  at full scale (peak 1.000) and audibly distorts; `simone` and `Riya` are clean.
+  No limiter is applied yet.
 
 ## Build
 

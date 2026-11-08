@@ -12,6 +12,7 @@ struct SynthesisOutcome {
   let audioSeconds: Double
   let samples: [Float]
   let timings: TimingReport
+  let chunkCount: Int
 }
 
 // Owns every synthesis so the CLI, the prewarmer and the HTTP server share one
@@ -98,17 +99,24 @@ final class Synthesizer {
     pitch: Float,
     volume: Float,
     wantsTimings: Bool,
-    playback: Bool
+    playback: Bool,
+    chunkSentences: Bool
   ) throws -> SynthesisOutcome {
     workLock.lock()
     defer { workLock.unlock() }
 
     let session = try sessionFor(generation: generation, voice: voice, pace: pace, expressivity: expressivity)
-    let request = SynthesisRequest(text: text, voice: voice)
-    request.synthesisContext.rate = rate
-    request.synthesisContext.pitch = pitch
-    request.synthesisContext.volume = volume
-    if generation == "expressive" { try applyExpressivePresets(to: request, pace: pace, expressivity: expressivity) }
+    // Only worth splitting when it yields more than one utterance; otherwise the
+    // original text is sent untouched, which keeps single-sentence renders exactly
+    // as they were before chunking existed.
+    let plannedChunks = chunkSentences ? TextChunker.chunks(from: text) : []
+    let utterances = plannedChunks.count > 1 ? plannedChunks : [TextChunk(text: text, utf16Location: 0)]
+
+    let decoder = ChunkDecoder()
+    let speaker = playback ? Speaker() : nil
+    var samples: [Float] = []
+    var anchors: [TimingAnchor] = []
+    var formats: [String] = []
 
     // The expressive model returns no word timings at all, so asking is pointless.
     var timingsSupported = false
@@ -122,63 +130,89 @@ final class Synthesizer {
       _ = pumpRunLoop(semaphore, timeout: 5)
     }
 
-    let decoder = ChunkDecoder()
-    let speaker = playback ? Speaker() : nil
-    var samples: [Float] = []
-    var rawTimings: [WordTimingInfo] = []
     let start = Date()
     var firstAudioAt: Date?
+    var audioSecondsBefore = 0.0
+    var wasCancelled = false
 
-    request.synthesisContext.didGenerateAudio = { chunk in
-      guard let buffer = decoder.decode(chunk) else { return }
-      if firstAudioAt == nil { firstAudioAt = Date() }
-      if let speaker {
-        speaker.enqueue(buffer)
-      } else if let channel = buffer.floatChannelData?[0] {
-        samples.append(contentsOf: UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
-      }
-    }
-    if wantsWordTimings {
-      // The daemon emits timings in batches, so batches are accumulated and
-      // de-duplicated by UTF-16 range. Overwriting lost every earlier batch:
-      // a 44-word sentence delivered only 16 words.
-      request.synthesisContext.didGenerateWordTimings = { reported in
-        for entry in reported where !rawTimings.contains(where: {
-          $0.textRange.location == entry.textRange.location && $0.textRange.length == entry.textRange.length
-        }) {
-          rawTimings.append(entry)
-        }
-      }
-    }
-
-    let finish = DispatchSemaphore(value: 0)
     stateLock.lock()
     cancelled = false
-    activeSession = session
-    activeRequest = request
-    activeSpeaker = speaker
     lastSpeaker = speaker
-    activeFinish = finish
     stateLock.unlock()
 
-    var synthesisError: Error?
-    session.synthesize(request: request) { error in
-      synthesisError = error
-      finish.signal()
+    for utterance in utterances {
+      let request = SynthesisRequest(text: utterance.text, voice: voice)
+      request.synthesisContext.rate = rate
+      request.synthesisContext.pitch = pitch
+      request.synthesisContext.volume = volume
+      if generation == "expressive" { try applyExpressivePresets(to: request, pace: pace, expressivity: expressivity) }
+
+      var chunkFrames = 0
+      request.synthesisContext.didGenerateAudio = { chunk in
+        guard let buffer = decoder.decode(chunk) else { return }
+        chunkFrames += Int(buffer.frameLength)
+        let described = decoder.describedFormat
+        if !formats.contains(described) { formats.append(described) }
+        if firstAudioAt == nil { firstAudioAt = Date() }
+        if let speaker {
+          speaker.enqueue(buffer)
+        } else if let channel = buffer.floatChannelData?[0] {
+          samples.append(contentsOf: UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
+        }
+      }
+      if wantsWordTimings {
+        // The daemon emits timings in batches, so batches are accumulated and
+        // de-duplicated by UTF-16 range. Overwriting lost every earlier batch:
+        // a 44-word sentence delivered only 16 words. Both the text range and the
+        // start time are rebased, otherwise the second sentence collides with the
+        // first on the timeline and reuses its offsets.
+        let locationBase = utterance.utf16Location
+        let timeBase = audioSecondsBefore
+        request.synthesisContext.didGenerateWordTimings = { reported in
+          for entry in reported {
+            let shifted = NSRange(
+              location: entry.textRange.location + locationBase,
+              length: entry.textRange.length
+            )
+            guard !anchors.contains(where: {
+              $0.textRange.location == shifted.location && $0.textRange.length == shifted.length
+            }) else { continue }
+            anchors.append(TimingAnchor(textRange: shifted, startTime: entry.startTime + timeBase))
+          }
+        }
+      }
+
+      let finish = DispatchSemaphore(value: 0)
+      stateLock.lock()
+      activeSession = session
+      activeRequest = request
+      activeSpeaker = speaker
+      activeFinish = finish
+      stateLock.unlock()
+
+      var synthesisError: Error?
+      session.synthesize(request: request) { error in
+        synthesisError = error
+        finish.signal()
+      }
+      let completed = pumpRunLoop(finish, timeout: 120)
+
+      stateLock.lock()
+      let cancelledNow = cancelled
+      activeSession = nil
+      activeRequest = nil
+      activeSpeaker = nil
+      activeFinish = nil
+      stateLock.unlock()
+
+      // A barge-in stops the whole utterance, not just the sentence in flight.
+      if cancelledNow { wasCancelled = true; break }
+      guard completed else { throw FridayError.timeout }
+      if let synthesisError { throw FridayError.synthesisFailed("\(synthesisError)") }
+      audioSecondsBefore += Double(chunkFrames) / 48000.0
     }
-    let completed = pumpRunLoop(finish, timeout: 120)
-
-    stateLock.lock()
-    let wasCancelled = cancelled
-    activeSession = nil
-    activeRequest = nil
-    activeSpeaker = nil
-    activeFinish = nil
-    stateLock.unlock()
 
     if wasCancelled { throw FridayError.cancelled }
-    guard completed else { throw FridayError.timeout }
-    if let synthesisError { throw FridayError.synthesisFailed("\(synthesisError)") }
 
     let synthesisSeconds = Date().timeIntervalSince(start)
     let firstAudioMilliseconds = firstAudioAt.map { $0.timeIntervalSince(start) * 1000 } ?? -1
@@ -186,13 +220,19 @@ final class Synthesizer {
       speaker.finish()
       _ = pumpRunLoop(speaker.drained, timeout: 900)
     }
+    // Chunked rendering finishes synthesising long before playback ends, so a
+    // barge-in usually lands here rather than inside the loop above.
+    stateLock.lock()
+    let cancelledDuringPlayback = cancelled
+    stateLock.unlock()
+    if cancelledDuringPlayback { throw FridayError.cancelled }
     let collectedSeconds = Double(samples.count) / 48000.0
     let playedSeconds = Double(speaker?.framesEnqueued ?? 0) / 48000.0
     let audioSeconds = max(collectedSeconds, playedSeconds)
     let timings = makeTimingReport(
       voice: voice,
       sourceText: text,
-      raw: rawTimings,
+      raw: anchors,
       supported: timingsSupported,
       generation: generation,
       audioSeconds: audioSeconds
@@ -201,12 +241,13 @@ final class Synthesizer {
       voiceName: voice.name ?? "-",
       language: voice.language,
       generation: generation,
-      sourceFormat: decoder.describedFormat,
+      sourceFormat: formats.isEmpty ? decoder.describedFormat : formats.joined(separator: "+"),
       firstAudioMilliseconds: firstAudioMilliseconds,
       synthesisSeconds: synthesisSeconds,
       audioSeconds: audioSeconds,
       samples: samples,
-      timings: timings
+      timings: timings,
+      chunkCount: utterances.count
     )
   }
 }

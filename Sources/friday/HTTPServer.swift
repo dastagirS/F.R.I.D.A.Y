@@ -146,7 +146,8 @@ final class HTTPServer {
         text: input, voice: voice, generation: generation,
         pace: config.pace ?? 3, expressivity: config.expressivity ?? 3,
         rate: max(0.25, min(4.0, speed)), pitch: 1.0, volume: 1.0,
-        wantsTimings: false, playback: false
+        wantsTimings: false, playback: false,
+        chunkSentences: config.sentenceChunking ?? FridayConfig.builtInSentenceChunking
       )
       let body = format == "wav"
         ? try wavData(samples: outcome.samples, sampleRate: 48000)
@@ -187,7 +188,8 @@ final class HTTPServer {
         text: text, voice: voice, generation: generation,
         pace: config.pace ?? 3, expressivity: config.expressivity ?? 3,
         rate: 1.0, pitch: 1.0, volume: 1.0,
-        wantsTimings: false, playback: true
+        wantsTimings: false, playback: true,
+        chunkSentences: config.sentenceChunking ?? FridayConfig.builtInSentenceChunking
       )
       respondJSON(client, 200, ["said": true, "voice": outcome.voiceName, "generation": outcome.generation])
     } catch {

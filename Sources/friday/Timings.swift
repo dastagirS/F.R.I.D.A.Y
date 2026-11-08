@@ -1,6 +1,14 @@
 import Foundation
 import SiriTTSService
 
+// One reported word, already shifted into the caller's original text and onto the
+// global audio timeline. Chunked synthesis renders each sentence separately, so the
+// daemon's per-request offsets have to be rebased before the report is built.
+struct TimingAnchor {
+  let textRange: NSRange
+  let startTime: Double
+}
+
 struct WordTiming: Codable {
   let text: String
   let start: Double
@@ -32,7 +40,7 @@ struct TimingReport: Codable {
 func makeTimingReport(
   voice: SynthesisVoice,
   sourceText: String,
-  raw: [WordTimingInfo],
+  raw: [TimingAnchor],
   supported: Bool,
   generation: String,
   audioSeconds: Double

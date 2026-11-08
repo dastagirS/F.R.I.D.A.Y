@@ -10,6 +10,14 @@ func pumpRunLoop(_ semaphore: DispatchSemaphore, timeout: TimeInterval) -> Bool 
   return false
 }
 
+func parseOnOff(_ raw: String) -> Bool? {
+  switch raw.lowercased() {
+  case "on", "true", "yes", "1": return true
+  case "off", "false", "no", "0": return false
+  default: return nil
+  }
+}
+
 func fourCharacterCode(_ value: UInt32) -> String {
   let bytes = [UInt8((value >> 24) & 0xFF), UInt8((value >> 16) & 0xFF), UInt8((value >> 8) & 0xFF), UInt8(value & 0xFF)]
   return String(bytes: bytes, encoding: .ascii) ?? "?"
