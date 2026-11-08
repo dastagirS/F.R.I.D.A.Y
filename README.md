@@ -1,403 +1,179 @@
 # friday
 
-Speaks text with Siri's own neural voices, straight from your Mac. No cloud, no
-third-party binaries, no audio files shipped anywhere.
+Local text-to-speech for macOS. Speaks with Siri's own neural voices — no cloud, no
+third-party binaries.
 
 ```bash
 friday "Say this out loud"
-echo "$REPLY" | friday -q -            # for a voice loop
+echo "$REPLY" | friday -q -          # for a voice loop
+llm | friday --stream -              # speak sentences while the model is still writing
 friday -o line.wav "render to a file"
-friday voices                          # installed voices and their asset path
-friday --skill                         # agent skill file: capabilities, limits, exit codes
+friday serve --port 8787             # HTTP API
+friday --skill                       # agent-facing contract: flags, limits, exit codes
 ```
 
-Installed as a symlink: `/opt/homebrew/bin/friday`.
+Installed as `/opt/homebrew/bin/friday`.
 
-## Default voice
+## Voice and config
 
-The built-in pair is `simone` on the **standard** render path — the expressive
-3B voice model is deliberately bypassed because it sounds theatrical. That pair
-is overridable through a config file, and CLI flags always win over it:
+Default is `simone` on the **standard** render path. The expressive 3B model sounds
+theatrical, so it stays opt-in via `--expressive`.
+
+CLI flag → config file → built-in. Config lives at `~/.config/friday/config.json`;
+a missing file is fine, an unparsable one is an error naming the file and key.
 
 ```bash
-friday config                                    # show effective settings
+friday voices                                   # installed voices
+friday voices --status simone                   # one voice in detail
+friday voices --available                       # all 149 assets Apple offers
+friday voices --install NAME --language en-GB --wait
+friday voices --purge com.apple.siri.tts.voice.ar_SA.samer.neural.premium --dry-run
+friday config                                   # effective settings
 friday config set default-voice simone --standard
-friday config set default-generation expressive
-friday config set pace 2
 friday config set sentence-chunking off
-friday config unset default-voice                # also clears the derived generation
+friday config unset default-voice
 friday config reset
 ```
 
-Stored at `~/.config/friday/config.json` (override the path with
-`FRIDAY_CONFIG=/some/file.json`, which is how the tests stay isolated).
+`--purge` takes the full asset specifier — the last column of `voices --available` —
+and does nothing without `--force`.
 
-Precedence: CLI flag → config file → built-in (`simone`, standard).
+`FRIDAY_CONFIG=/path.json` overrides the config path (the tests use this).
 
-## Subcommands
-
-```bash
-friday serve  [--port 8787] [--host 127.0.0.1] [--auth-token-env VAR] [--prewarm]
-friday voices [--status NAME | --install NAME --language xx [--wait] | --manage | --default NAME]
-friday config [set KEY VALUE | unset KEY | reset]
-friday --completions zsh|bash|fish
-friday --man
-friday --skill
-```
-
-`--skill` prints the agent-facing contract: what friday can do, how to call it,
-which flags matter, and which paths are unverified. It is embedded in the binary
-so it cannot drift from the installed build.
-
-`serve` also solves cold start: one process holds one `DaemonSession`, so every
-request is warm (measured 47–72 ms to first audio versus ~0.5 s per CLI call).
-
-### HTTP endpoints
-
-```
-POST /v1/audio/speech   {input, voice?, generation?, response_format: wav|pcm, speed?}
-POST /say               {text, voice?}      synthesise, start playback, then return
-                                            (synchronous: it does not return early)
-POST /stop                                  cancel playback + synthesis (barge-in)
-GET  /v1/models                             installed voices, OpenAI-shaped
-GET  /healthz                               {status, voices, defaultVoice, uptimeSeconds}
-```
-
-`--auth-token-env VAR` requires `Authorization: Bearer $VAR` on every route.
-Responses carry `X-Friday-Voice`, `X-Friday-Generation`, `X-Friday-Source`.
-
-## Sentence chunking
-
-On by default, and the measurements behind it are worth knowing exactly, because
-they are messier than they first looked.
-
-`sirittsd` picks its encoder per request and offers no control over it:
-
-| observation | result |
-|---|---|
-| same text, repeated while the daemon is hot | `lpcm` 48 kHz — lossless |
-| same text, after ~20 s idle | `opus` 48 kHz — about 50 kbps, lossy |
-| four-sentence paragraph as one request | `opus`, 6 attempts out of 6 |
-| the same paragraph as four requests | `lpcm`, 4 out of 4 |
-
-Both encodings decode to the same number of samples for the same text, so this is
-transport, not a different voice or model. `simone` and `Simone` even render
-byte-identical audio, and `disableCompactVoice`, `forceOspreyTTS`,
-`synthesisProfile` and `synthesisPriority` change nothing. At ~50 kbps the voice
-sounds thinner, which is what was heard first and measured second.
-
-The lever that actually works is `clearDeviceCache()` — a private no-argument
-method on `DaemonSession` that costs 0.00 s and puts the next synthesis back on
-the lossless encoder:
-
-```
-warm daemon, plain request            opus   synthesis 0.02s
-clearDeviceCache(), then request      lpcm   synthesis 0.45s   <- 3/3 repeats
-warm session held open, no clearing   opus   even after 120s idle
-```
-
-Warming the session is not a fix; it locks the daemon into the lossy mode. So
-`friday` clears the cache before each request by default:
+## Server
 
 ```bash
-friday --lossless "default"      # explicit
-friday --fast "accept opus"      # ~0.2s less synthesis per sentence
-friday config set lossless off
+friday serve [--port 8787] [--host 127.0.0.1] [--auth-token-env VAR] [--prewarm]
 ```
 
-Measured cost, four-sentence paragraph: lossless `lpcm` throughout in 2.20 s of
-synthesis with first audio at 70 ms, versus mixed `lpcm`/`opus` in 1.65 s with
-first audio at 44 ms. Renders report `src=` and `codec=lossy`, so the format is
-visible rather than left to the ear.
-
-`friday` also sends one sentence per request, so the first word plays while later
-sentences are still rendering. The cost is a little cross-sentence prosody.
-
-```bash
-friday --chunked "default"        # explicit
-friday --no-chunked "one request" # the old behaviour: lossy above one sentence
-friday config set sentence-chunking off
+```
+POST /v1/audio/speech   {input, voice?, generation?, response_format: wav|pcm, speed?, stream?}
+POST /say               {text, voice?}   speak, then return when playback starts
+POST /stop                               cancel playback and synthesis
+GET  /v1/models                          installed voices
+GET  /healthz                            status, voice count, uptime
 ```
 
-Splitting is deliberately conservative: a boundary needs whitespace after the
-terminator, so `18.5`, `a.m.`, `v2.0` stay whole; `Dr.`, `Mr.`, `e.g.`, `U.S.`
-are guarded; quoted endings such as `"stop."` travel with their sentence. Word
-timings are rebased onto the original text and the global timeline, so they stay
-correct across chunks. Splitting stops at 200 chunks or 20,000 characters and
-falls back to a single request.
+`--auth-token-env VAR` requires `Authorization: Bearer $VAR` on every route. Responses
+carry `X-Request-Id`, `X-Friday-Voice`, `X-Friday-Generation` and `X-Friday-Source`.
+Errors use the OpenAI envelope: `{"error": {"message", "type", "param", "code"}}`.
 
-## Word timings
-
-```bash
-friday --timings "print timings as JSON"
-friday --timings-out t.json -o line.wav "write them to a file"
-```
-
-Two things worth knowing:
-
-- Only the **standard** path produces timings. The expressive 3B model returns
-  none, and the report says `"timingsSupported": false` rather than inventing
-  them.
-- `queryWordTimingSupport` under-reports on this build (answers false while
-  still delivering timings), so the delivered set decides the flag.
-- End times are derived from the next word's start, so every entry carries
-  `endDerived: true`.
+`serve` keeps one daemon session alive, so requests are warm: 47–72 ms to first audio
+versus roughly 0.5 s for a cold CLI call.
 
 ## Streaming
 
-Two different things can stream, and only one of them did before.
-
-**Audio** always streams: the daemon hands over packets as it renders, so playback
-starts long before synthesis ends.
-
-**Text** needed two new paths:
+Audio always streams — playback starts while synthesis continues.
 
 ```bash
-llm | friday --stream -        # speak each sentence while the model is still writing
-```
+llm | friday --stream -        # one sentence per request, spoken as it completes
 
-Measured with two sentences three seconds apart, the first was spoken at **324 ms**
-— while the producer was still sleeping — instead of after EOF.
-
-Over HTTP:
-
-```bash
-# streamed audio out: raw 48 kHz mono s16le, chunked transfer
+# streamed audio out: chunked raw 48 kHz mono s16le
 curl -N -X POST localhost:8787/v1/audio/speech \
-  -d '{"input":"...","response_format":"pcm","stream":true}' | your_player
+  -d '{"input":"...","response_format":"pcm","stream":true}'
 
-# streamed text in: newline-delimited JSON on a chunked body
-printf '%s\n' '{"text":"First sentence."}' '{"text":"Second one."}' \
+# streaming text in: NDJSON on a chunked body
+printf '%s\n' '{"text":"First."}' '{"text":"Second.","end":true}' \
   | curl -N -X POST localhost:8787/say -H 'Transfer-Encoding: chunked' --data-binary @-
 ```
 
-| measurement | result |
-|---|---|
-| streamed response, first audio | 59 ms |
-| same text, buffered response | 2015 ms |
-| streaming `/say`, two lines 3 s apart | sentence 1 spoken before line 2 was sent |
+A streamed response returns first audio in ~60 ms where the buffered form needs ~2 s.
+`stream` requires `response_format: "pcm"` — WAV needs a length a stream cannot know.
+NDJSON accepts `text`, `flush`, `voice`, `end`.
 
-`{"stream": true}` requires `response_format: "pcm"` — WAV carries a length in its
-header, which a stream cannot know, so asking for both is a 400 with that reason.
-NDJSON on `/say` accepts `{"text"}`, `{"flush": true}`, `{"voice"}`, `{"end": true}`.
+Bounds: 500 sentences and 20 000 characters per stream, 4 MB per chunked body, long
+unpunctuated runs cut at a word boundary every 800 characters.
 
-Bounds: 500 sentences and 20,000 characters per stream, 4 MB per chunked body, and an
-unpunctuated run-on is cut at a word boundary every 800 characters. The server is still
-single-threaded, so `/stop` cannot preempt a stream in flight; Ctrl-C on the CLI can.
+## Audio quality
+
+The daemon picks its encoder per request and will not be told which to use; idle or
+warm it answers lossy Opus (~50 kbps, audibly thinner). `friday` clears the daemon's
+device cache before each request, which puts it back on lossless PCM.
+
+```bash
+friday --lossless "default"        # explicit
+friday --fast "accept opus"        # ~0.2 s less synthesis per sentence
+```
+
+Text is split one sentence per request, so the first word plays while later sentences
+render. Splitting is conservative: `18.5`, `a.m.`, `v2.0`, `Dr.`, `U.S.` and quoted
+endings stay whole. Beyond 200 chunks or 20 000 characters it falls back to one request.
+
+```bash
+friday --chunked "default"           # one sentence per request
+friday --no-chunked "one request"    # lossy above one sentence
+friday config set lossless off
+```
+
+`--timings` prints word timings as JSON, `--timings-out FILE` writes them. Standard path
+only; the expressive model returns none.
 
 ## Debugging
 
-Failures print one line on stderr: what failed, why, and the next step. Nothing that
-matters is silent — an unparsable flag is an error rather than text to speak, a bad
-numeric value is rejected rather than defaulted, and a config file that exists but
-cannot be parsed stops the run instead of quietly falling back to built-ins.
-
 ```bash
-friday --debug "text"                        # stage trace on stderr
-FRIDAY_DEBUG=1 friday propose "text"         # same, for a service or script
-FRIDAY_DEBUG=1 FRIDAY_DEBUG_LOG=/tmp/f.log friday serve   # capture without the terminal
+friday --debug "text"
+FRIDAY_DEBUG=1 FRIDAY_DEBUG_LOG=/tmp/f.log friday serve
 ```
 
-The trace covers config resolution, the resolved voice and asset key, which session and
-render path was chosen, per-request source format and frame counts, any chunk that fails
-to decode, and the playback drain.
-
-Exit codes name the class of failure, so a script can branch without parsing text:
+Exit codes name the failure class:
 
 | code | meaning |
 |---:|---|
 | 0 | success |
-| 1 | unexpected failure (re-run with `--debug`) |
-| 2 | bad usage: unknown flag/subcommand, or invalid value |
+| 1 | unexpected (re-run with `--debug`) |
+| 2 | bad usage or invalid value |
 | 3 | sirittsd unreachable |
-| 4 | unknown voice (message suggests the nearest installed name) |
-| 5 | config file unreadable or unparsable (message names file and key) |
+| 4 | unknown voice (suggests the nearest installed name) |
+| 5 | config unreadable or unparsable |
 | 6 | synthesis failed |
-| 7 | timeout (message names stage and seconds) |
+| 7 | timeout |
 | 8 | no audio produced |
-| 9 | output failed (file write, audio engine, or system helper) |
-| 130 | cancelled with Ctrl-C, printed as nothing |
+| 9 | output failed |
+| 130 | cancelled |
 
-Over HTTP, failures use the OpenAI envelope `{"error": {"message", "type", "param",
-"code"}}` with codes like `unknown_voice`, `invalid_json`, `daemon_unavailable`,
-`timeout`, and every response carries `X-Request-Id`, which also appears in the server's
-debug log.
-
-## How it works
-
-`/System/Library/PrivateFrameworks/SiriTTSService.framework` exposes a
-`DaemonSession` that talks to `sirittsd`. The framework has no public Swift
-interface, so `interfaces/` holds a hand-written one containing only what this
-tool needs. A `DaemonSession` needs `_clientId = "com.apple.siritts-tool"` for
-the expressive voices, plus `voicePacePreset` / `voiceExpressivityPreset` set by
-KVC on the request context — without those the daemon silently substitutes a
-generic legacy render.
-
-The daemon returns audio in **three** shapes and chooses on its own:
-
-| source | when | note |
-|---|---|---|
-| `lpcm` 16-bit int | standard path, single sentence | 22.05–48 kHz |
-| `lpcm` 32-bit float | expressive, short text | 24 kHz |
-| `opus` packets | standard path, multi-sentence | 48 kHz, ~50 kbps, lossy |
-| `opus` packets | expressive, longer text | 48 kHz, 960 frames per packet |
-
-Everything is normalised to 48 kHz float mono by `ChunkDecoder` before playback
-or writing. Skipping that is what makes output sound shredded: float bytes under
-an integer WAV header, or Opus packets written as PCM. Chunks can also arrive
-with an all-zero `AudioStreamBasicDescription`, so a format is only trusted once
-`isPlausibleFormat` accepts it.
-
-Voice assets themselves are MobileAsset bundles (`com.apple.siri.tts.voice...`
-under `/System/Library/AssetsV2/com_apple_MobileAsset_UAF_Siri_TextToSpeech/`).
-
-```bash
-friday voices --available                      # Apple's full catalog: 149 assets
-friday voices --install NAME --language en-GB --wait
-friday voices --purge SPECIFIER --dry-run      # show what would be removed
-friday voices --purge SPECIFIER --force        # actually delete it
-```
-
-`--install` subscribes to an asset; downloads are asynchronous, so `--wait`
-polls the installed inventory. Language *frontend* bundles are separate from
-voice bundles — an expressive en-GB voice fails with `Cannot find resource
-asset` without them.
-
-`--purge` is guarded: an ambiguous name is refused rather than guessed at, it
-prints the plan and does nothing without `--force`, and success is judged by the
-filesystem rather than by the elimination call's return value. The filesystem is
-the only trustworthy signal because on this macOS the synchronous MobileAsset
-client can report an entitlement error while `mobileassetd` still completes the
-removal.
-
-The catalog lives behind private classes with no headers, which makes two things
-mandatory rather than optional: every getter checks its Objective-C type encoding
-first (`locallyAvailable` is `B16@0:8`, `versionNumber` is `q16@0:8`; calling
-`perform` on a scalar getter yields a bogus object pointer and crashes), and
-`+alloc` must be reached through `class_getClassMethod` — asking the class object
-for the instance implementation returns a forwarding stub that aborts on use.
-
-## Layout
-
-```
-Sources/friday/main.swift          argument parsing, dispatch, Ctrl-C barge-in
-Sources/friday/Voices.swift        catalog, resolution, generation policy
-Sources/friday/Synthesizer.swift   one synthesis path for CLI, prewarm and server
-Sources/friday/Decoder.swift       Opus / float / int → 48 kHz float mono
-Sources/friday/Speaker.swift       streaming playback, stop, drain
-Sources/friday/Timings.swift       word timing assembly + JSON
-Sources/friday/HTTPServer.swift    POSIX sockets, no dependencies
-Sources/friday/Commands.swift      serve / voices / config
-Sources/friday/Help.swift          usage, completion scripts, man page
-Sources/FridayCore/TextChunker.swift   sentence splitting, whole-string + streaming
-Sources/FridayCore/Config.swift        persisted defaults
-Sources/FridayCore/Util.swift          errors, WAV encoding, run-loop pump
-Sources/FridayCore/Debug.swift         stage tracing
-Sources/FridayCore/TextDecoder.swift   incremental UTF-8 across reads
-Package.swift                      one target, one test target
-Tests/FridayTests/CoreTests.swift  logic: chunking, taxonomy, config, WAV, UTF-8
-Tests/FridayTests/BinaryTests.swift CLI, config files, HTTP routes, auth, SIGINT
-Tests/FridayTests/AudioTests.swift real synthesis and streaming (opt-in)
-Tests/FridayTests/Support.swift    binary runner, HTTP and WAV helpers
-```
-
-One executable target holds both source directories, so the tests reach the logic with
-`@testable import friday` — the code under test is the code that ships, without the
-library needing a `public` surface it does not otherwise want.
+An unparsable flag is an error, not text to speak. Bad values are refused rather than
+defaulted.
 
 ## Tests
 
 ```bash
-./build.sh                      # SwiftPM, Command Line Tools
+./build.sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
-FRIDAY_AUDIO_TESTS=1 DEVELOPER_DIR=… swift test   # adds real synthesis
-swift test --filter ChunkingTests                # one area
+FRIDAY_AUDIO_TESTS=1 DEVELOPER_DIR=… swift test    # adds real synthesis
+swift test --filter ChunkingTests                  # one area
 ```
 
-64 tests in about 5 s, or 14 audio tests in 8 s on top. The audio tests skip themselves
-unless `FRIDAY_AUDIO_TESTS=1`, because they need the daemon, this machine's voice
-assets, and they make sound.
+64 XCTest cases, about 5 s. The 9 audio tests skip themselves unless
+`FRIDAY_AUDIO_TESTS=1`: they need the daemon, this machine's voice assets, and they make
+sound.
 
-**Why `DEVELOPER_DIR`.** XCTest is an Xcode component: Command Line Tools ships the
-compiler and SDK but no `XCTest.framework`, so plain `swift test` against CLT fails with
-`unable to resolve module dependency: 'XCTest'` — a long-standing limitation, not a
-project setting ([explanation](https://forums.swift.org/t/will-swift-testing-allow-testing-w-o-xcode-on-macos/73843)).
-Swift Testing is no escape here either: CLT has `Testing.framework` but its macro plugin
-fails to load. `DEVELOPER_DIR` is Apple's documented per-invocation pointer to a
-developer directory, and pointing it at Xcode makes both frameworks available with no
-`sudo` and no `xcode-select` change. For anyone who would rather not type it, one-time
-`sudo xcode-select --switch /Applications/Xcode.app` makes plain `swift test` work.
-Building never needs Xcode — only testing does. (`swift test --toolchain …` does not work
-here; it mixes CLT and Xcode dylibs and still cannot find XCTest.)
+XCTest ships with Xcode, not Command Line Tools, so plain `swift test` fails with
+`unable to resolve module dependency: 'XCTest'`. `DEVELOPER_DIR` points at a developer
+directory that has it — no sudo, no `xcode-select` change. A one-time
+`sudo xcode-select --switch /Applications/Xcode.app` also works. Building never needs
+Xcode, only testing does. There is no CI: the audio checks need this machine.
 
-The suite is deliberately local. There is no CI: `friday` synthesises through an
-undocumented private framework and per-machine voice assets, so a GitHub runner could
-only ever run the first two tiers, and the check that matters most — does the locked-in
-voice still sound clean — needs this machine.
+## Limits
 
-Before this suite existed every check was an ad-hoc shell run, which is how a dropped
-buffer in the chunked-body reader, a forced split that cut at the wrong space, and a
-stream that hung on a stalled producer all survived to be found by hand.
-
-## Verification status
-
-Covered by the suite above: sentence splitting against the boundary
-cases (abbreviations, decimals, quoted endings, ellipsis, no terminator, UTF-16
-offsets), streaming buffer behaviour including bounded forced splits, the exit-code
-taxonomy, config round trips and rejections, WAV header layout and PCM clamping, the
-CLI surface (help, unknown flags, corrupt config, completions, man, skill), the HTTP
-routes with their error envelope and `X-Request-Id`, and bearer auth. The audio tier
-adds real synthesis: 48 kHz mono 16-bit output, the locked-in voice staying clean,
-chunked paragraphs, timings, and refusal paths.
-
-Written while building the suite, both confirmed by reading the code and recorded as
-ticket #43: `--generation theatrical` is silently ignored instead of refused, and
-`--help` omits `--skill` even though the usage text, man page and completions all
-document it. `Tests/FridayTests/BinaryTests.swift` pins today's silent behaviour in a
-test named after the gap, so it stays visible rather than forgotten — and fails loudly
-when the ticket lands and the expectation needs flipping.
-
-Exercised end to end on macOS 27.2: CLI defaults and overrides, word timings
-(including a 44-word sentence, which previously lost 28 words), timings to file,
-prewarm, all config verbs, voice list/status/available/default, purge dry-run,
-ambiguity and unknown-voice refusals, every failure path (typo'd flags, unknown
-subcommands, bad numeric values, missing values, corrupt config, unknown voice),
-completion scripts (zsh and bash pass their own syntax checkers), man page, skill
-file, and every HTTP route including bearer auth. Audio correctness is checked by
-amplitude (peak/rms) rather than by ear.
-
-Not verified, deliberately or unavoidably:
-
-- **Actual deletion of an installed bundle.** `--force` on a real voice would
-  remove a working Apple asset, and the re-download path is itself untested, so
-  only the elimination call ABI was proven — against a specifier that is not
-  installed, where the call is a harmless no-op.
-- **`--install` download and `--wait` polling** — never pulled a 20–250 MB
+- Private Apple framework (`SiriTTSService`). An OS update can break it; not App
+  Store shippable.
+- `/stop` cannot preempt a stream in flight — the server is single-threaded. Ctrl-C
+  on the CLI can.
+- `nora` clips on the standard path (1.17% of samples at full scale). `simone` and
+  `Riya` are clean.
+- `voices --install` and `--purge --force` have not been exercised against a real
   bundle.
-- **`/stop` preempting an in-flight synthesis** — the server is single-threaded
-  on the main run loop (required by `sirittsd`), so `/stop` is queued behind the
-  request it would cancel. CLI Ctrl-C barge-in does work: exit 130 in 0.73 s,
-  including during playback drain after chunked synthesis has finished.
-- **Clipping on a loud voice.** `nora` on the standard path renders 1.17% of samples
-  at full scale (peak 1.000) and audibly distorts; `simone` and `Riya` are clean.
-  No limiter is applied yet.
+- Uses `AVAudioEngine.connect` / `AVAudioPlayerNode.play`, deprecated in macOS 27.
+- macOS 27 minimum.
 
-## Build
+## Layout
 
-```bash
-./build.sh      # swift build -c release, then copies the product to ./friday
+```
+Sources/friday/          CLI, daemon session, decoder, speaker, HTTP server
+Sources/FridayCore/      chunking, config, errors, WAV encoding, debug tracing
+Tests/FridayTests/       logic, binary/HTTP, audio (opt-in)
+Package.swift            one target, one test target
+build.sh                 swift build -c release, copies the product
 ```
 
-## Caveats
-
-- Private Apple framework. Undocumented, unentitled, and an OS update can break
-  it. Fine on your own Mac; not shippable to the App Store.
-- Two installed voices differ only by case — `Simone` (neural) and `simone`
-  (expressive). Exact-case matching runs first.
-- `friday --prewarm` measures fast (~0.03 s) because the daemon acknowledges
-  before loading; the useful place for prewarming is `friday serve --prewarm`,
-  where the session survives.
-- `say -v <name>` cannot do any of this: on macOS 27 it accepts any name, ignores
-  it, and speaks in the default voice without an error.
-- `AVAudioEngine.connect` and `AVAudioPlayerNode.play` are deprecated in macOS 27
-  (4 build warnings); still functional.
+Implementation notes (encodings, cache behaviour, MobileAsset ABI): [docs/internals.md](docs/internals.md).
