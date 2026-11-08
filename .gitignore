@@ -1,0 +1,6 @@
+# Build artifact: rebuild with ./build.sh (the PATH symlink points at the file on
+# disk, so ignoring it does not unpublish the installed command).
+/friday
+
+# macOS metadata
+.DS_Store
