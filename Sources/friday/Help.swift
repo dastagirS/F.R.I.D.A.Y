@@ -7,6 +7,7 @@ friday — speak text with Siri's voices, locally
 
   friday "text"                 speak it aloud
   echo "$REPLY" | friday -q -   read stdin, stay quiet (the loop form)
+  llm | friday --stream -       speak each sentence as the model writes it
   friday -o line.wav "text"     write a WAV instead of playing
 
   friday --help                 every flag and subcommand
@@ -44,6 +45,8 @@ OPTIONS
       --prewarm           load the voice/model without speaking
       --chunked           one sentence per request: lossless audio (default)
       --no-chunked        send the whole text as one request
+      --stream            speak stdin sentence by sentence as it arrives
+                          (requires '-' as the text argument)
       --debug             print stage-by-stage diagnostics to stderr
                           (FRIDAY_DEBUG=1, FRIDAY_DEBUG_LOG=FILE also work)
       --lossless          drop the daemon cache per request so it renders
@@ -123,6 +126,7 @@ _friday() {
     '--man[print the manual page]' \\
     '--skill[print the agent skill file]' \\
     '--debug[print stage diagnostics]' \\
+    '--stream[speak stdin sentence by sentence]' \\
     '-l[list voices]' '--list[list voices]' \\
     '-q[quiet]' '--quiet[quiet]' \\
     '--completions[print completion script]:shell:(zsh bash fish)' \\
@@ -171,6 +175,7 @@ complete -c friday -l lossless -d 'always render lossless PCM'
 complete -c friday -l fast -d 'accept the lossy encoder for speed'
 complete -c friday -l skill -d 'print the agent skill file'
 complete -c friday -l debug -d 'print stage diagnostics'
+complete -c friday -l stream -d 'speak stdin sentence by sentence'
 complete -c friday -s l -l list -d 'list voices'
 complete -c friday -s q -l quiet -d 'quiet'
 complete -c friday -l completions -a 'zsh bash fish'
@@ -246,6 +251,13 @@ audibly thins the voice. Default.
 .BR \\-\\-fast
 Skip the cache drop and accept the lossy encoder, saving about 0.2 seconds of synthesis
 per sentence.
+.TP
+.BR \\-\\-stream
+Read stdin and speak one sentence per request as soon as its boundary is proven, so
+the first words play while the producer is still writing. Requires
+.B -
+as the text argument. The tail is spoken on EOF, and an unpunctuated run-on is split
+at a word boundary every 800 characters so it cannot become one enormous utterance.
 .TP
 .BR \\-\\-debug
 Print stage-by-stage diagnostics to stderr: config, resolved voice and asset, session,
@@ -416,6 +428,45 @@ word ends at the audio duration.
 
 The expressive path returns no timings and reports `timingsSupported: false` rather
 than inventing them. Timings are not yet wired into the HTTP endpoints.
+
+## Streaming
+
+Two modes exist, and they stream different things.
+
+Audio always streams: the daemon delivers packets as it renders them, so playback
+starts long before synthesis finishes (a four-sentence answer gives first audio in tens
+of milliseconds).
+
+Text streams only when asked:
+
+```bash
+llm | friday --stream -            # speak each sentence as it arrives
+```
+
+`--stream` reads stdin as it comes (a blocking read that returns on any bytes, not on a
+full buffer) and speaks each sentence the moment its boundary is proven by the same
+abbreviation and decimal rules as whole-text mode. Sentence one starts playing while
+the model is still writing sentence two. EOF speaks whatever tail is left; a run-on
+without punctuation is split at a word boundary every 800 characters.
+
+Over HTTP:
+
+- `POST /v1/audio/speech` with `{"stream": true, "response_format": "pcm"}` returns a
+  `Transfer-Encoding: chunked` body of raw 48 kHz mono signed-16 PCM, so a client can
+  play the first bytes instead of waiting for the whole render (measured 59 ms to first
+  audio versus 2015 ms for the same text unstreamed). Streaming requires `pcm`: WAV
+  needs a length in its header, which a stream cannot provide, so `wav` plus `stream`
+  is a 400.
+- `POST /say` accepts a chunked request body of newline-delimited JSON:
+  `{"text": "..."}` appends text and speaks every complete sentence immediately,
+  `{"flush": true}` speaks the buffered tail even mid-sentence, `{"voice": "nora"}`
+  switches voice for the rest, and `{"end": true}` finishes. The response is JSON with
+  the sentence count. If a line is not a JSON object the request fails 400 before that
+  line is spoken; sentences already spoken stay spoken.
+
+Limits: 500 sentences and 20,000 characters per stream, 4 MB per chunked body. A
+mid-stream synthesis failure cannot change the status line, so the body is truncated
+without its terminating chunk and the request id appears in the debug log.
 
 ## Warm start
 

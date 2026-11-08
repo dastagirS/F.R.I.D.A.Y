@@ -101,6 +101,15 @@ enum TextChunker {
     character == "." || character == "!" || character == "?" || character == "…"
   }
 
+  // True when a finished-looking sentence ends in a terminator, quotes and brackets
+  // aside. The streaming splitter uses this to stop waiting for more input.
+  static func endsWithSentenceEnd(_ text: String) -> Bool {
+    var characters = Array(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    while let last = characters.last, closingMarks.contains(last) { characters.removeLast() }
+    guard let last = characters.last else { return false }
+    return isTerminator(last)
+  }
+
   // A sentence ends only when what follows looks like the start of a new one:
   // "a.m. on Tuesday" stays whole, "Done. Next" splits.
   private static func isBoundary(at index: Int, in characters: [Character]) -> Bool {
@@ -156,5 +165,76 @@ enum TextChunker {
     let slice = String(characters[firstVisible...to]).trimmingCharacters(in: .whitespacesAndNewlines)
     guard !slice.isEmpty else { return nil }
     return TextChunk(text: slice, utf16Location: utf16Start[firstVisible])
+  }
+}
+
+
+// Sentence splitting for text that is still arriving. The whole-string splitter can
+// look ahead at the word after a period; a stream can only judge what it has, so the
+// tail is held back until a boundary is followed by a complete word. Everything else
+// (abbreviations, decimals, quoted endings) reuses the same rules through chunks(from:).
+struct StreamingSentenceSplitter {
+  // Beyond this the tail is flushed at a word boundary. 800 characters is roughly
+  // half a minute of speech: long enough to keep normal prose intact, short enough
+  // that a run-on paragraph is never rendered as one enormous utterance.
+  static let maximumTailLength = 800
+
+  private(set) var buffered = ""
+
+  mutating func append(_ text: String) {
+    buffered += text
+  }
+
+  // Complete sentences only. A trailing fragment is held back because it may be half
+  // a word, but a final chunk that already ends in a terminator is finished: waiting
+  // for the next sentence to arrive would add that entire pause to the latency.
+  mutating func takeSentences() -> [String] {
+    var sentences: [String] = []
+    // A run-on with no punctuation must not wait for a boundary that never comes.
+    while buffered.count > Self.maximumTailLength, sentences.count < 4 {
+      let head = String(buffered.prefix(Self.maximumTailLength))
+      guard let cut = head.lastIndex(of: " ") else { break }
+      let piece = String(head[..<cut]).trimmingCharacters(in: .whitespacesAndNewlines)
+      buffered = String(buffered.dropFirst(head.distance(from: head.startIndex, to: cut) + 1))
+      if !piece.isEmpty { sentences.append(piece) }
+    }
+    let chunks = TextChunker.chunks(from: buffered)
+    guard let last = chunks.last else { return sentences }
+    let source = buffered as NSString
+    let tailStart = last.utf16Location + (last.text as NSString).length
+    let tail = tailStart <= source.length ? source.substring(from: tailStart) : ""
+    let finished = tail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      && TextChunker.endsWithSentenceEnd(last.text)
+    if finished {
+      buffered = ""
+      sentences.append(contentsOf: chunks.map(\.text))
+    } else {
+      buffered = source.substring(from: last.utf16Location)
+      sentences.append(contentsOf: chunks.dropLast().map(\.text))
+    }
+    return sentences
+  }
+
+  // End of input: whatever is left is spoken, split at word boundaries so an
+  // unpunctuated tail does not become a single multi-minute utterance.
+  mutating func flush() -> [String] {
+    var pieces: [String] = []
+    while true {
+      let remainder = buffered.trimmingCharacters(in: .whitespacesAndNewlines)
+      buffered = ""
+      guard !remainder.isEmpty else { break }
+      if remainder.count <= Self.maximumTailLength || pieces.count >= 25 {
+        pieces.append(remainder)
+        break
+      }
+      let head = String(remainder.prefix(Self.maximumTailLength))
+      guard let cut = head.lastIndex(of: " ") else {
+        pieces.append(remainder)
+        break
+      }
+      pieces.append(String(head[..<cut]))
+      buffered = String(remainder[remainder.index(after: cut)...])
+    }
+    return pieces
   }
 }

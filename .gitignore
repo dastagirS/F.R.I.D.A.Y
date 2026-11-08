@@ -2,5 +2,8 @@
 # disk, so ignoring it does not unpublish the installed command).
 /friday
 
+# Test build products: rebuild with ./test.sh.
+/.build/
+
 # macOS metadata
 .DS_Store

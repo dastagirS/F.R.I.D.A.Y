@@ -20,6 +20,8 @@ struct SpeakOptions {
   var prewarm = false
   var chunked: Bool?
   var lossless: Bool?
+  var stream = false
+  var readsStdin = false
   var listVoices = false
   var quiet = false
   var showHelp = false
@@ -126,6 +128,7 @@ func parseSpeakOptions(_ arguments: [String]) throws -> SpeakOptions {
     case "--prewarm": options.prewarm = true
     case "--chunked": options.chunked = true
     case "--no-chunked": options.chunked = false
+    case "--stream": options.stream = true
     case "--lossless": options.lossless = true
     case "--fast": options.lossless = false
     case "-q", "--quiet": options.quiet = true
@@ -142,8 +145,11 @@ func parseSpeakOptions(_ arguments: [String]) throws -> SpeakOptions {
   }
   let joined = positionals.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
   if joined == "-" {
-    let data = FileHandle.standardInput.readDataToEndOfFile()
-    options.text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    options.readsStdin = true
+    if !options.stream {
+      let data = FileHandle.standardInput.readDataToEndOfFile()
+      options.text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
   } else if !joined.isEmpty {
     options.text = joined
   }
@@ -222,6 +228,18 @@ func runSpeak(_ arguments: [String], config: FridayConfig) throws {
     let seconds = try synthesizer.prewarm(voice: voice, generation: generation, pace: pace, expressivity: expressivity)
     print(String(format: "prewarmed %@ [%@] %@ in %.2fs", voice.name ?? "-", voice.language,
                  generation == "expressive" ? "expressive pace\(pace) expressivity\(expressivity)" : "standard", seconds))
+    return
+  }
+
+  if options.stream {
+    guard options.readsStdin else {
+      throw FridayError.usage("--stream needs text on stdin: echo \"$REPLY\" | friday --stream -")
+    }
+    try runStreamingStdin(
+      voice: voice, generation: generation, pace: pace, expressivity: expressivity,
+      rate: options.rate, pitch: options.pitch, volume: options.volume,
+      chunkSentences: chunkSentences, lossless: lossless, quiet: options.quiet
+    )
     return
   }
 

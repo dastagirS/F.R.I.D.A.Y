@@ -103,7 +103,8 @@ final class Synthesizer {
     wantsTimings: Bool,
     playback: Bool,
     chunkSentences: Bool,
-    lossless: Bool
+    lossless: Bool,
+    onAudio: ((AVAudioPCMBuffer) -> Void)? = nil
   ) throws -> SynthesisOutcome {
     workLock.lock()
     defer { workLock.unlock() }
@@ -136,6 +137,7 @@ final class Synthesizer {
 
     let start = Date()
     var firstAudioAt: Date?
+    var streamedFrames = 0
     var audioSecondsBefore = 0.0
     var wasCancelled = false
 
@@ -171,10 +173,14 @@ final class Synthesizer {
           return
         }
         chunkFrames += Int(buffer.frameLength)
+        if onAudio != nil { streamedFrames += Int(buffer.frameLength) }
         let described = decoder.describedFormat
         if !formats.contains(described) { formats.append(described) }
         if firstAudioAt == nil { firstAudioAt = Date() }
-        if let speaker {
+        if let onAudio {
+          // Streaming caller: hand over the audio as it arrives and keep nothing.
+          onAudio(buffer)
+        } else if let speaker {
           speaker.enqueue(buffer)
         } else if let channel = buffer.floatChannelData?[0] {
           samples.append(contentsOf: UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
@@ -267,7 +273,7 @@ final class Synthesizer {
     let cancelledDuringPlayback = cancelled
     stateLock.unlock()
     if cancelledDuringPlayback { throw FridayError.cancelled }
-    let collectedSeconds = Double(samples.count) / 48000.0
+    let collectedSeconds = Double(samples.count + streamedFrames) / 48000.0
     let playedSeconds = Double(speaker?.framesEnqueued ?? 0) / 48000.0
     let audioSeconds = max(collectedSeconds, playedSeconds)
     guard audioSeconds > 0 else {

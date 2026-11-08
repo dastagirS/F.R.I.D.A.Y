@@ -143,6 +143,48 @@ Two things worth knowing:
 - End times are derived from the next word's start, so every entry carries
   `endDerived: true`.
 
+## Streaming
+
+Two different things can stream, and only one of them did before.
+
+**Audio** always streams: the daemon hands over packets as it renders, so playback
+starts long before synthesis ends.
+
+**Text** needed two new paths:
+
+```bash
+llm | friday --stream -        # speak each sentence while the model is still writing
+```
+
+Measured with two sentences three seconds apart, the first was spoken at **324 ms**
+— while the producer was still sleeping — instead of after EOF.
+
+Over HTTP:
+
+```bash
+# streamed audio out: raw 48 kHz mono s16le, chunked transfer
+curl -N -X POST localhost:8787/v1/audio/speech \
+  -d '{"input":"...","response_format":"pcm","stream":true}' | your_player
+
+# streamed text in: newline-delimited JSON on a chunked body
+printf '%s\n' '{"text":"First sentence."}' '{"text":"Second one."}' \
+  | curl -N -X POST localhost:8787/say -H 'Transfer-Encoding: chunked' --data-binary @-
+```
+
+| measurement | result |
+|---|---|
+| streamed response, first audio | 59 ms |
+| same text, buffered response | 2015 ms |
+| streaming `/say`, two lines 3 s apart | sentence 1 spoken before line 2 was sent |
+
+`{"stream": true}` requires `response_format: "pcm"` — WAV carries a length in its
+header, which a stream cannot know, so asking for both is a 400 with that reason.
+NDJSON on `/say` accepts `{"text"}`, `{"flush": true}`, `{"voice"}`, `{"end": true}`.
+
+Bounds: 500 sentences and 20,000 characters per stream, 4 MB per chunked body, and an
+unpunctuated run-on is cut at a word boundary every 800 characters. The server is still
+single-threaded, so `/stop` cannot preempt a stream in flight; Ctrl-C on the CLI can.
+
 ## Debugging
 
 Failures print one line on stderr: what failed, why, and the next step. Nothing that
@@ -238,33 +280,75 @@ for the instance implementation returns a forwarding stub that aborts on use.
 ## Layout
 
 ```
-Sources/friday/main.swift        argument parsing, dispatch, Ctrl-C barge-in
-Sources/friday/Config.swift      persisted defaults
-Sources/friday/Voices.swift      catalog, resolution, generation policy
-Sources/friday/Synthesizer.swift one synthesis path for CLI, prewarm and server
-Sources/friday/Decoder.swift     Opus / float / int → 48 kHz float mono
-Sources/friday/Speaker.swift     streaming playback, stop, drain
-Sources/friday/Timings.swift     word timing assembly + JSON
-Sources/friday/TextChunker.swift sentence splitting for the lossless path
-Sources/friday/HTTPServer.swift  POSIX sockets, no dependencies
-Sources/friday/Commands.swift    serve / voices / config
-Sources/friday/Help.swift        usage, completion scripts, man page
-Sources/friday/Util.swift        errors, WAV encoding, run-loop pump
+Sources/friday/main.swift          argument parsing, dispatch, Ctrl-C barge-in
+Sources/friday/Voices.swift        catalog, resolution, generation policy
+Sources/friday/Synthesizer.swift   one synthesis path for CLI, prewarm and server
+Sources/friday/Decoder.swift       Opus / float / int → 48 kHz float mono
+Sources/friday/Speaker.swift       streaming playback, stop, drain
+Sources/friday/Timings.swift       word timing assembly + JSON
+Sources/friday/HTTPServer.swift    POSIX sockets, no dependencies
+Sources/friday/Commands.swift      serve / voices / config
+Sources/friday/Help.swift          usage, completion scripts, man page
+Sources/FridayCore/TextChunker.swift   sentence splitting, whole-string + streaming
+Sources/FridayCore/Config.swift        persisted defaults
+Sources/FridayCore/Util.swift          errors, WAV encoding, run-loop pump
+Sources/FridayCore/Debug.swift         stage tracing
+Tests/CoreTests/main.swift         checks for FridayCore (no daemon needed)
+Tests/blackbox.sh                  CLI and HTTP behaviour of the built binary
+Tests/audio.sh                     real synthesis, timings, clipping measurement
+test.sh                            runs the tiers
 ```
 
+`FridayCore` is compiled into the binary and compiled again by the tests, so the code
+under test is the code that ships rather than a copy.
+
+## Tests
+
+```bash
+./test.sh           # core logic, no daemon, no audio (mostly the build)
+./test.sh --server  # adds CLI + HTTP black-box checks
+./test.sh --audio   # adds real synthesis, timings, clipping measurement
+./test.sh --all     # all three
+```
+
+190 checks in about 15 s for `--all`. The tiers are split by what they cost: the
+default tier needs no daemon and makes no sound, the audio tier synthesises real
+speech and is therefore opt-in.
+
+The suite is deliberately local. There is no CI: `friday` synthesises through an
+undocumented private framework and per-machine voice assets, so a GitHub runner could
+only ever run the first two tiers, and the check that matters most — does the locked-in
+voice still sound clean — needs this machine.
+
+Before this suite existed every check was an ad-hoc shell run, which is how a dropped
+buffer in the chunked-body reader, a forced split that cut at the wrong space, and a
+stream that hung on a stalled producer all survived to be found by hand.
+
 ## Verification status
+
+Now covered by the committed suite above: sentence splitting against the boundary
+cases (abbreviations, decimals, quoted endings, ellipsis, no terminator, UTF-16
+offsets), streaming buffer behaviour including bounded forced splits, the exit-code
+taxonomy, config round trips and rejections, WAV header layout and PCM clamping, the
+CLI surface (help, unknown flags, corrupt config, completions, man, skill), the HTTP
+routes with their error envelope and `X-Request-Id`, and bearer auth. The audio tier
+adds real synthesis: 48 kHz mono 16-bit output, the locked-in voice staying clean,
+chunked paragraphs, timings, and refusal paths.
+
+Written while building the suite, both confirmed by reading the code and recorded as
+ticket #43: `--generation theatrical` is silently ignored instead of refused, and
+`--help` omits `--skill` even though the usage text, man page and completions all
+document it. `Tests/blackbox.sh` pins the current silent behaviour with a comment
+pointing at the ticket, so the gap stays visible rather than forgotten.
 
 Exercised end to end on macOS 27.2: CLI defaults and overrides, word timings
 (including a 44-word sentence, which previously lost 28 words), timings to file,
 prewarm, all config verbs, voice list/status/available/default, purge dry-run,
 ambiguity and unknown-voice refusals, every failure path (typo'd flags, unknown
 subcommands, bad numeric values, missing values, corrupt config, unknown voice),
-completion scripts (zsh and bash pass their
-own syntax checkers), man page, skill file, and every HTTP route
-including bearer auth. Sentence splitting is checked against seven boundary
-cases (abbreviations, decimals, quoted endings, ellipsis, no terminator), and
-timings are verified to map back onto the original text after chunking. Audio
-correctness is checked by amplitude (peak/rms) rather than by ear.
+completion scripts (zsh and bash pass their own syntax checkers), man page, skill
+file, and every HTTP route including bearer auth. Audio correctness is checked by
+amplitude (peak/rms) rather than by ear.
 
 Not verified, deliberately or unavoidably:
 
@@ -286,6 +370,7 @@ Not verified, deliberately or unavoidably:
 
 ```bash
 ./build.sh      # swiftc; needs Command Line Tools with the macOS 26+ SDK
+./test.sh       # build, then the checks
 ```
 
 ## Caveats

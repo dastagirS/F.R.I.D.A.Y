@@ -45,6 +45,7 @@ enum FridayError: Error, CustomStringConvertible {
   case synthesisFailed(String)
   case timeout(stage: String, seconds: Double)
   case nothingCaptured(chunks: Int, formats: String)
+  case emptyInput(String)
   case audioOutput(String)
   case usage(String)
   case config(String)
@@ -62,6 +63,8 @@ enum FridayError: Error, CustomStringConvertible {
       return "timed out after \(Int(seconds))s waiting for \(stage)"
     case .nothingCaptured(let chunks, let formats):
       return "produced no audio from \(chunks) request(s); daemon formats seen: \(formats.isEmpty ? "none" : formats)"
+    case .emptyInput(let reason):
+      return "no audio produced: \(reason)"
     case .audioOutput(let reason): return reason
     case .usage(let text): return text
     case .config(let text): return text
@@ -77,7 +80,7 @@ enum FridayError: Error, CustomStringConvertible {
     case .config: return 5
     case .synthesisFailed: return 6
     case .timeout: return 7
-    case .nothingCaptured: return 8
+    case .nothingCaptured, .emptyInput: return 8
     case .audioOutput: return 9
     case .cancelled: return 130
     }

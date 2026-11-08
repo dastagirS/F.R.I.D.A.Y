@@ -223,6 +223,110 @@ func runVoices(_ arguments: [String], config: FridayConfig) throws {
   }
 }
 
+// Streaming stdin: speak each sentence as soon as its boundary is proven, so the first
+// words play while the producer is still writing. The tail is spoken on EOF or when a
+// forced split bounds it. Ctrl-C cancels the sentence in flight and also ends the wait
+// for more input, so a stalled producer cannot make the process unstoppable.
+func runStreamingStdin(
+  voice: SynthesisVoice,
+  generation: String,
+  pace: Int,
+  expressivity: Int,
+  rate: Float,
+  pitch: Float,
+  volume: Float,
+  chunkSentences: Bool,
+  lossless: Bool,
+  quiet: Bool
+) throws {
+  let synthesizer = Synthesizer(catalog: try VoiceCatalog.open())
+  // Ctrl-C while waiting for input cancels nothing in flight, so the wait itself has to
+  // end: without this flag the loop keeps polling a producer that will never speak.
+  var interrupted = false
+  signal(SIGINT, SIG_IGN)
+  let interruptSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+  interruptSource.setEventHandler {
+    interrupted = true
+    synthesizer.cancelActive()
+  }
+  interruptSource.resume()
+
+  var splitter = StreamingSentenceSplitter()
+  var spoken = 0
+  var audioSeconds = 0.0
+  var firstAudioMilliseconds = -1.0
+  var failure: Error?
+  var finishedReading = false
+  let started = Date()
+
+  func speak(_ sentence: String) {
+    guard failure == nil else { return }
+    do {
+      let outcome = try synthesizer.synthesize(
+        text: sentence, voice: voice, generation: generation,
+        pace: pace, expressivity: expressivity, rate: rate, pitch: pitch, volume: volume,
+        wantsTimings: false, playback: true,
+        // Each piece is already a sentence, so splitting again would only add round trips.
+        chunkSentences: false, lossless: lossless
+      )
+      spoken += 1
+      audioSeconds += outcome.audioSeconds
+      if firstAudioMilliseconds < 0 { firstAudioMilliseconds = outcome.firstAudioMilliseconds }
+      Debug.stage("stream", "spoke \(spoken) (\(sentence.count) chars) at \(String(format: "%.0f", Date().timeIntervalSince(started) * 1000))ms")
+    } catch {
+      failure = error
+    }
+  }
+
+  func consume(_ text: String) {
+    guard failure == nil, !text.isEmpty else { return }
+    splitter.append(text)
+    for sentence in splitter.takeSentences() { speak(sentence) }
+  }
+
+  // Reads happen off the main thread. `availableData` blocks until bytes exist, and a
+  // stalled producer would otherwise freeze the run loop that delivers Ctrl-C, leaving
+  // a process no signal could stop. Decoded text hops back to main so synthesis stays
+  // on the thread sirittsd expects.
+  let reading = DispatchQueue(label: "friday.stdin")
+  reading.async {
+    var decoder = IncrementalUTF8Decoder()
+    while true {
+      let data = FileHandle.standardInput.availableData
+      if data.isEmpty {
+        let tail = decoder.finish()
+        DispatchQueue.main.async {
+          consume(tail)
+          finishedReading = true
+        }
+        return
+      }
+      let text = decoder.append(data)
+      guard !text.isEmpty else { continue }
+      DispatchQueue.main.async { consume(text) }
+    }
+  }
+
+  // Pumping the run loop is what lets the SIGINT source fire between reads.
+  while !finishedReading && failure == nil && !interrupted {
+    RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+  }
+  if let failure { throw failure }
+  if interrupted { throw FridayError.cancelled }
+  for sentence in splitter.flush() { speak(sentence) }
+  if let failure { throw failure }
+
+  guard spoken > 0 else {
+    throw FridayError.emptyInput("stdin closed before a complete sentence arrived")
+  }
+  if !quiet {
+    FileHandle.standardError.write(String(
+      format: "streamed=%d audio=%.2fs first_audio=%.0fms wall=%.2fs\n",
+      spoken, audioSeconds, firstAudioMilliseconds, Date().timeIntervalSince(started)
+    ).data(using: .utf8)!)
+  }
+}
+
 func runConfig(_ arguments: [String], config: FridayConfig) throws {
   var updated = config
   var iterator = arguments.makeIterator()
