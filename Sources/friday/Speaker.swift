@@ -14,6 +14,9 @@ final class Speaker {
   private var synthesisDone = false
   private var stopped = false
   private(set) var framesEnqueued = 0
+  // Set when AVAudioEngine refuses to start; the caller turns this into exit code 9
+  // instead of reporting a successful utterance that made no sound.
+  private(set) var startupFailure: Error?
   private let lock = NSLock()
   let drained = DispatchSemaphore(value: 0)
 
@@ -52,7 +55,14 @@ final class Speaker {
       try engine.start()
       node.play()
     } catch {
-      FileHandle.standardError.write("audio engine failed to start: \(error)\n".data(using: .utf8)!)
+      lock.lock()
+      startupFailure = error
+      stopped = true
+      lock.unlock()
+      Debug.stage("playback", "audio engine failed to start: \(error)")
+      FileHandle.standardError.write("friday: audio engine failed to start: \(error)\n".data(using: .utf8)!)
+      // Without this the caller waits for a drain that can never arrive.
+      drained.signal()
     }
   }
 

@@ -20,6 +20,8 @@ func runServe(_ arguments: [String], config: FridayConfig) throws -> Never {
       tokenEnvironmentName = iterator.next()
     case "--prewarm":
       prewarmOnStart = true
+    case "--debug":
+      Debug.enable()
     case "-h", "--help":
       print(usageText)
       exit(0)
@@ -56,6 +58,7 @@ func runVoices(_ arguments: [String], config: FridayConfig) throws {
   var iterator = arguments.makeIterator()
   while let argument = iterator.next() {
     switch argument {
+    case "--debug": Debug.enable()
     case "--status": action = "status"; target = iterator.next()
     case "--install": action = "install"; target = iterator.next()
     case "--available": action = "available"
@@ -172,7 +175,9 @@ func runVoices(_ arguments: [String], config: FridayConfig) throws {
       subscribeError = error
       subscribeDone.signal()
     }
-    guard pumpRunLoop(subscribeDone, timeout: 30) else { throw FridayError.timeout }
+    guard pumpRunLoop(subscribeDone, timeout: 30) else {
+      throw FridayError.timeout(stage: "a voice download request", seconds: 30)
+    }
     if let subscribeError { throw FridayError.synthesisFailed("\(subscribeError)") }
     print("requested\t\(language)\t\(target)\t(download is asynchronous)")
     guard waitForInstall else { return }
@@ -184,19 +189,27 @@ func runVoices(_ arguments: [String], config: FridayConfig) throws {
       }
       Thread.sleep(forTimeInterval: 2)
     }
-    throw FridayError.timeout
+    throw FridayError.timeout(
+      stage: "'\(target)' to finish downloading", seconds: timeoutSeconds
+    )
 
   case "manage":
     let url = "x-apple.systempreferences:com.apple.preference.universalaccess?SpokenContent"
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
     process.arguments = [url]
-    try? process.run()
+    do {
+      try process.run()
+    } catch {
+      throw FridayError.audioOutput("cannot open System Settings: \(error.localizedDescription); open it manually: \(url)")
+    }
     print("opened System Settings -> Accessibility -> Spoken Content")
 
   case "default":
     guard let target else { throw FridayError.usage("--default needs a voice name") }
-    guard let match = catalog.find(name: target) else { throw FridayError.unknownVoice(target) }
+    guard let match = catalog.find(name: target) else {
+      throw FridayError.unknownVoice(target, suggestion: catalog.suggestion(for: target))
+    }
     var updated = config
     updated.defaultVoice = match.name ?? target
     // Without an explicit flag the asset's own nature decides, but passing
@@ -217,6 +230,7 @@ func runConfig(_ arguments: [String], config: FridayConfig) throws {
   var generationFlag: String?
   while let argument = iterator.next() {
     switch argument {
+    case "--debug": Debug.enable()
     case "--standard", "--legacy": generationFlag = "standard"
     case "--expressive": generationFlag = "expressive"
     case "-h", "--help":
@@ -240,6 +254,8 @@ func runConfig(_ arguments: [String], config: FridayConfig) throws {
     print("expressivity\t\(updated.expressivity.map(String.init) ?? "3 (built-in)")")
     let chunking = updated.sentenceChunking ?? FridayConfig.builtInSentenceChunking
     print("sentence-chunking\t\(chunking ? "on" : "off")\(updated.sentenceChunking == nil ? " (built-in)" : "")")
+    let lossless = updated.lossless ?? FridayConfig.builtInLossless
+    print("lossless\t\(lossless ? "on" : "off")\(updated.lossless == nil ? " (built-in)" : "")")
 
   case "set":
     guard verbs.count >= 3 else { throw FridayError.usage("config set needs a key and a value") }
@@ -249,7 +265,9 @@ func runConfig(_ arguments: [String], config: FridayConfig) throws {
     case "default-voice":
       // Validate against installed voices so a typo cannot silently persist.
       let catalog = try VoiceCatalog.open()
-      guard let match = catalog.find(name: value) else { throw FridayError.unknownVoice(value) }
+      guard let match = catalog.find(name: value) else {
+        throw FridayError.unknownVoice(value, suggestion: catalog.suggestion(for: value))
+      }
       updated.defaultVoice = match.name ?? value
       if let generationFlag {
         updated.defaultGeneration = generationFlag
@@ -269,6 +287,12 @@ func runConfig(_ arguments: [String], config: FridayConfig) throws {
       }
       updated.sentenceChunking = parsed
       try save()
+    case "lossless":
+      guard let parsed = parseOnOff(value) else {
+        throw FridayError.usage("lossless must be on or off")
+      }
+      updated.lossless = parsed
+      try save()
     case "pace", "expressivity":
       guard let number = Int(value), (1...5).contains(number) else {
         throw FridayError.usage("\(key) must be 1 through 5")
@@ -276,7 +300,7 @@ func runConfig(_ arguments: [String], config: FridayConfig) throws {
       if key == "pace" { updated.pace = number } else { updated.expressivity = number }
       try save()
     default:
-      throw FridayError.usage("unknown key '\(key)'; use default-voice, default-generation, sentence-chunking, pace, expressivity")
+      throw FridayError.usage("unknown key '\(key)'; use default-voice, default-generation, sentence-chunking, lossless, pace, expressivity")
     }
 
   case "unset":
@@ -288,6 +312,7 @@ func runConfig(_ arguments: [String], config: FridayConfig) throws {
       updated.defaultGeneration = nil
     case "default-generation": updated.defaultGeneration = nil
     case "sentence-chunking": updated.sentenceChunking = nil
+    case "lossless": updated.lossless = nil
     case "pace": updated.pace = nil
     case "expressivity": updated.expressivity = nil
     default: throw FridayError.usage("unknown key '\(verbs[1])'")

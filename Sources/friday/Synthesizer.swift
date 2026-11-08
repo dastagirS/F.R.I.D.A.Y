@@ -60,7 +60,9 @@ final class Synthesizer {
       failure = error
       finish.signal()
     }
-    guard pumpRunLoop(finish, timeout: 120) else { throw FridayError.timeout }
+    guard pumpRunLoop(finish, timeout: 120) else {
+      throw FridayError.timeout(stage: "the prewarm request", seconds: 120)
+    }
     if let failure { throw FridayError.synthesisFailed("\(failure)") }
     return Date().timeIntervalSince(start)
   }
@@ -100,7 +102,8 @@ final class Synthesizer {
     volume: Float,
     wantsTimings: Bool,
     playback: Bool,
-    chunkSentences: Bool
+    chunkSentences: Bool,
+    lossless: Bool
   ) throws -> SynthesisOutcome {
     workLock.lock()
     defer { workLock.unlock() }
@@ -111,6 +114,7 @@ final class Synthesizer {
     // as they were before chunking existed.
     let plannedChunks = chunkSentences ? TextChunker.chunks(from: text) : []
     let utterances = plannedChunks.count > 1 ? plannedChunks : [TextChunk(text: text, utf16Location: 0)]
+    Debug.stage("plan", "\(utterances.count) request(s), \(text.count) chars, chunking=\(chunkSentences), lossless=\(lossless)")
 
     let decoder = ChunkDecoder()
     let speaker = playback ? Speaker() : nil
@@ -140,7 +144,15 @@ final class Synthesizer {
     lastSpeaker = speaker
     stateLock.unlock()
 
-    for utterance in utterances {
+    for (index, utterance) in utterances.enumerated() {
+      // The daemon answers lossless PCM for the first synthesis after its compiled
+      // cache is dropped, then falls back to ~50 kbps Opus. Clearing per request keeps
+      // every sentence on the lossless encoder; measured cost is ~0.45 s of synthesis
+      // per sentence instead of 0.02 s, paid once before the first audio.
+      if lossless {
+        session.clearDeviceCache()
+        Debug.stage("cache", "cleared device cache before request")
+      }
       let request = SynthesisRequest(text: utterance.text, voice: voice)
       request.synthesisContext.rate = rate
       request.synthesisContext.pitch = pitch
@@ -148,8 +160,16 @@ final class Synthesizer {
       if generation == "expressive" { try applyExpressivePresets(to: request, pace: pace, expressivity: expressivity) }
 
       var chunkFrames = 0
+      var undecodable = 0
       request.synthesisContext.didGenerateAudio = { chunk in
-        guard let buffer = decoder.decode(chunk) else { return }
+        // The daemon ends every request with an empty chunk carrying a zeroed
+        // description. That is not a failure; counting it would warn on every render.
+        guard !chunk.audioData.isEmpty else { return }
+        guard let buffer = decoder.decode(chunk) else {
+          undecodable += 1
+          Debug.stage("decode", "chunk failed: \(chunk.audioData.count) bytes, asbd=\(fourCharacterCode(chunk.asbd.mFormatID)) \(Int(chunk.asbd.mSampleRate))Hz")
+          return
+        }
         chunkFrames += Int(buffer.frameLength)
         let described = decoder.describedFormat
         if !formats.contains(described) { formats.append(described) }
@@ -207,8 +227,22 @@ final class Synthesizer {
 
       // A barge-in stops the whole utterance, not just the sentence in flight.
       if cancelledNow { wasCancelled = true; break }
-      guard completed else { throw FridayError.timeout }
-      if let synthesisError { throw FridayError.synthesisFailed("\(synthesisError)") }
+      guard completed else {
+        throw FridayError.timeout(
+          stage: "synthesis of request \(index + 1) of \(utterances.count) (\(utterance.text.count) characters)",
+          seconds: 120
+        )
+      }
+      if let synthesisError {
+        throw FridayError.synthesisFailed("\(synthesisError) [request \(index + 1) of \(utterances.count)]")
+      }
+      if undecodable > 0 {
+        // Silent drops used to make this look like a rendering quirk: audio simply had holes.
+        FileHandle.standardError.write(
+          "friday: warning: \(undecodable) audio chunk(s) from request \(index + 1) could not be decoded and were skipped\n"
+            .data(using: .utf8)!)
+      }
+      Debug.stage("chunk", "\(index + 1)/\(utterances.count) \(utterance.text.count) chars src=\(decoder.describedFormat) frames=\(chunkFrames) undecodable=\(undecodable)")
       audioSecondsBefore += Double(chunkFrames) / 48000.0
     }
 
@@ -218,7 +252,14 @@ final class Synthesizer {
     let firstAudioMilliseconds = firstAudioAt.map { $0.timeIntervalSince(start) * 1000 } ?? -1
     if let speaker {
       speaker.finish()
-      _ = pumpRunLoop(speaker.drained, timeout: 900)
+      let drained = pumpRunLoop(speaker.drained, timeout: 900)
+      if let failure = speaker.startupFailure {
+        throw FridayError.audioOutput("cannot play audio: \(failure.localizedDescription)")
+      }
+      if !drained {
+        throw FridayError.timeout(stage: "playback to finish", seconds: 900)
+      }
+      Debug.stage("playback", "drained \(speaker.framesEnqueued) frames")
     }
     // Chunked rendering finishes synthesising long before playback ends, so a
     // barge-in usually lands here rather than inside the loop above.
@@ -229,6 +270,13 @@ final class Synthesizer {
     let collectedSeconds = Double(samples.count) / 48000.0
     let playedSeconds = Double(speaker?.framesEnqueued ?? 0) / 48000.0
     let audioSeconds = max(collectedSeconds, playedSeconds)
+    guard audioSeconds > 0 else {
+      throw FridayError.nothingCaptured(
+        chunks: utterances.count,
+        formats: formats.isEmpty ? decoder.describedFormat : formats.joined(separator: ", ")
+      )
+    }
+    Debug.stage("done", "audio=\(String(format: "%.2f", audioSeconds))s formats=\(formats.joined(separator: ", "))")
     let timings = makeTimingReport(
       voice: voice,
       sourceText: text,

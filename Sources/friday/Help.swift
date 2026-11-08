@@ -1,5 +1,22 @@
 import Foundation
 
+// Shown when friday is run with no text: enough to act on, with the full listing one
+// flag away, which is what the CLI guidelines ask for on a bare invocation.
+let conciseUsageText = """
+friday — speak text with Siri's voices, locally
+
+  friday "text"                 speak it aloud
+  echo "$REPLY" | friday -q -   read stdin, stay quiet (the loop form)
+  friday -o line.wav "text"     write a WAV instead of playing
+
+  friday --help                 every flag and subcommand
+  friday --skill                agent skill file
+  friday voices                 installed voices
+  friday config                 effective settings
+
+Diagnostics go to stderr; add --debug for stage-by-stage detail.
+"""
+
 let usageText = """
 friday — speak text with Siri's voices, locally
 
@@ -26,13 +43,22 @@ OPTIONS
       --timings-out FILE  write word timings JSON to FILE
       --prewarm           load the voice/model without speaking
       --chunked           one sentence per request: lossless audio (default)
-      --no-chunked        send the whole text as one request (lossy above one
-                          sentence, where the daemon switches to ~50 kbps Opus)
+      --no-chunked        send the whole text as one request
+      --debug             print stage-by-stage diagnostics to stderr
+                          (FRIDAY_DEBUG=1, FRIDAY_DEBUG_LOG=FILE also work)
+      --lossless          drop the daemon cache per request so it renders
+                          lossless PCM instead of ~50 kbps Opus (default)
+      --fast              skip that, accepting the lossy encoder, to save
+                          about 0.2s of synthesis per sentence
   -l, --list              list installed voices
   -q, --quiet             suppress the timing line
       --completions SH    print a completion script (zsh | bash | fish)
       --man               print the man page (roff)
   -h, --help              this text
+
+Exit codes: 0 ok, 1 unexpected failure, 2 bad usage, 3 daemon unavailable,
+4 unknown voice, 5 bad config, 6 synthesis failed, 7 timeout, 8 produced no
+audio, 9 audio output failed, 130 cancelled (Ctrl-C).
 
 Word timings come only from the standard render path; the expressive 3B model
 returns none, and friday reports timingsSupported: false rather than inventing them.
@@ -60,6 +86,7 @@ friday config — persisted defaults (CLI flags always win)
   friday config set default-voice NAME [--standard]     persist default voice
   friday config set default-generation standard|expressive
   friday config set sentence-chunking on|off
+  friday config set lossless on|off
   friday config set pace 1-5
   friday config set expressivity 1-5
   friday config unset KEY
@@ -91,8 +118,11 @@ _friday() {
     '--prewarm[load the voice without speaking]' \\
     '--chunked[one sentence per request: lossless]' \\
     '--no-chunked[send the whole text as one request]' \\
+    '--lossless[always render lossless PCM]' \\
+    '--fast[accept the lossy encoder for speed]' \\
     '--man[print the manual page]' \\
     '--skill[print the agent skill file]' \\
+    '--debug[print stage diagnostics]' \\
     '-l[list voices]' '--list[list voices]' \\
     '-q[quiet]' '--quiet[quiet]' \\
     '--completions[print completion script]:shell:(zsh bash fish)' \\
@@ -137,7 +167,10 @@ complete -c friday -l timings -d 'print word timings JSON'
 complete -c friday -l prewarm -d 'load the voice without speaking'
 complete -c friday -l chunked -d 'one sentence per request, lossless audio'
 complete -c friday -l no-chunked -d 'send the whole text as one request'
+complete -c friday -l lossless -d 'always render lossless PCM'
+complete -c friday -l fast -d 'accept the lossy encoder for speed'
 complete -c friday -l skill -d 'print the agent skill file'
+complete -c friday -l debug -d 'print stage diagnostics'
 complete -c friday -s l -l list -d 'list voices'
 complete -c friday -s q -l quiet -d 'quiet'
 complete -c friday -l completions -a 'zsh bash fish'
@@ -198,8 +231,72 @@ returns none and the report says so.
 .BR \\-\\-prewarm
 Load the voice and model without speaking.
 .TP
+.BR \\-\\-chunked
+Synthesise one sentence per request, so the first word plays while later sentences
+are still rendering. Default.
+.TP
+.BR \\-\\-no-chunked
+Send the whole text as a single request instead.
+.TP
+.BR \\-\\-lossless
+Drop the daemon's compiled audio cache before each request, which puts it back on the
+lossless PCM encoder. A warm daemon otherwise answers with roughly 50 kbps Opus, which
+audibly thins the voice. Default.
+.TP
+.BR \\-\\-fast
+Skip the cache drop and accept the lossy encoder, saving about 0.2 seconds of synthesis
+per sentence.
+.TP
+.BR \\-\\-debug
+Print stage-by-stage diagnostics to stderr: config, resolved voice and asset, session,
+cache handling, then per request the source format, frames and decode failures.
+.BR FRIDAY_DEBUG=1
+does the same,
+.BR FRIDAY_DEBUG_LOG=FILE
+redirects it to a file.
+.TP
 .BR \\-l ", " \\-\\-list
 List installed voices with their generation.
+.SH EXIT STATUS
+Small integers, one per failure class, rather than sysexits values; the nearest
+sysexits equivalents are 64 (usage), 69 (unavailable), 70 (software) and 78 (config).
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Unexpected failure. Re-run with
+.B \\-\\-debug
+for the stage that failed.
+.TP
+.B 2
+Bad usage: unknown flag or subcommand, or an invalid flag value.
+.TP
+.B 3
+sirittsd is unreachable.
+.TP
+.B 4
+No installed voice matched the requested name.
+.TP
+.B 5
+The config file exists but cannot be read or parsed. The message names the file and the
+offending key.
+.TP
+.B 6
+The daemon reported a synthesis failure.
+.TP
+.B 7
+Timed out; the message names the stage and the number of seconds.
+.TP
+.B 8
+Synthesis produced no audio.
+.TP
+.B 9
+Output failed: cannot write the file, the audio engine refused to start, or a system
+helper such as opening System Settings failed.
+.TP
+.B 130
+Cancelled with Ctrl-C, which is a barge-in rather than an error.
 .SH SERVER
 .B friday serve
 listens on 127.0.0.1:8787 by default and exposes
@@ -209,9 +306,6 @@ listens on 127.0.0.1:8787 by default and exposes
 .BR GET " /v1/models" ,
 .BR GET " /healthz" .
 Pass \\fB\\-\\-auth-token-env VAR\\fR to require a bearer token from environment VAR.
-.SH EXIT STATUS
-2 usage, 3 daemon unavailable, 4 unknown voice, 6 synthesis failed, 7 timeout,
-8 nothing captured, 130 cancelled.
 .SH CAVEATS
 Uses a private Apple framework. Undocumented, unentitled, and an OS update can
 break it. Not shippable to the App Store.
@@ -291,19 +385,21 @@ rejected by the user; use it only when explicitly asked, and never as a default.
 
 ## Sentence chunking
 
-The daemon chooses its encoder per request and cannot be told which to use: lossless
-48 kHz PCM on some requests, roughly 50 kbps Opus on others, for identical text. The
-choice tracks internal daemon state, not the text or the flags, so a render can come
-back lossy no matter what you pass.
+The daemon answers the first synthesis after a quiet spell with lossless 48 kHz PCM and
+then falls back to roughly 50 kbps Opus for every request after that, which audibly
+thins the voice. Keeping a session warm pins it in the lossy mode, so do not reach for
+prewarm to fix sound quality.
 
-Small requests land on the lossless encoder far more often than whole paragraphs, so
-`friday` sends one sentence per request by default, which also lowers time to first
-word. `--no-chunked` sends the whole text as one request. Either way the render reports
-`codec=lossy` on stderr when the daemon went lossy, and `src=` always shows the real
-source format; treat lossless as likely, never guaranteed.
+`friday` drops the daemon's compiled cache before each request (a private
+`clearDeviceCache` call, about 0.00 s) which puts it back on the lossless encoder. That
+is on by default; `--fast` skips it and accepts the lossy encoder to save about 0.2 s of
+synthesis per sentence. Renders report `src=` and `codec=lossy` on stderr, so the format
+is always visible rather than left to the ear.
 
-Chunking costs a little cross-sentence prosody. It bounds itself to 200 chunks and
-20,000 characters, and falls back to a single request beyond either.
+`friday` also sends one sentence per request, which lets the first word play while later
+sentences render. `--no-chunked` sends the whole text as one request. Chunking costs a
+little cross-sentence prosody, bounds itself to 200 chunks and 20,000 characters, and
+falls back to a single request beyond either.
 
 ## Word timings
 
@@ -373,9 +469,23 @@ user asked for that voice by name.
 
 ## Exit codes
 
-`0` ok, `2` usage or config, `3` daemon unavailable, `4` unknown voice, `6` synthesis
-failed, `7` timeout, `8` nothing captured, `130` cancelled. Ctrl-C during playback is a
-barge-in and exits 130, so treat 130 as success when the user interrupted.
+`0` ok, `1` unexpected failure, `2` bad usage, `3` daemon unavailable, `4` unknown
+voice, `5` bad config file, `6` synthesis failed, `7` timeout, `8` produced no audio,
+`9` audio output failed, `130` cancelled. Ctrl-C during playback is a barge-in and
+exits 130 with no message, so treat 130 as success when the user interrupted.
+
+## Debugging a failure
+
+Errors are one line on stderr: what failed, why, and the next step. Reproduce with
+`--debug` to get a stage trace on stderr, or `FRIDAY_DEBUG=1` and
+`FRIDAY_DEBUG_LOG=/tmp/friday.log` to capture it without touching the terminal. The
+trace covers config resolution, the resolved voice and asset key, the render session,
+cache handling, and per request the source format, frames and any decode failures.
+
+Over HTTP every response carries `X-Request-Id`, which also appears in the server's
+debug log, and failures use the OpenAI envelope
+`{"error": {"message", "type", "param", "code"}}` with codes such as `unknown_voice`,
+`invalid_json`, `daemon_unavailable`, `timeout`.
 
 ## Latency on this machine (M3, 16 GB)
 

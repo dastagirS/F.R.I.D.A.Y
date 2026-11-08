@@ -19,12 +19,87 @@ struct SpeakOptions {
   var timingsPath: String?
   var prewarm = false
   var chunked: Bool?
+  var lossless: Bool?
   var listVoices = false
   var quiet = false
   var showHelp = false
   var completionsShell: String?
   var showMan = false
   var showSkill = false
+  var debug = false
+}
+
+// Flags that take a value, for the "did you mean" suggestion on a typo.
+let speakFlags: [String] = [
+  "-h", "--help", "-l", "--list", "-v", "--voice", "--language", "--generation",
+  "--standard", "--legacy", "--expressive", "--pace", "--expressivity", "-r", "--rate",
+  "--pitch", "--volume", "-o", "--out", "--timings", "--timings-out", "--prewarm",
+  "--chunked", "--no-chunked", "--lossless", "--fast", "-q", "--quiet", "--completions",
+  "--man", "--skill", "--debug"
+]
+let subcommands = ["serve", "voices", "config"]
+
+// Edit distance, used only to suggest a correction for a mistyped flag or subcommand.
+func editDistance(_ left: String, _ right: String) -> Int {
+  let a = Array(left), b = Array(right)
+  guard !a.isEmpty else { return b.count }
+  guard !b.isEmpty else { return a.count }
+  var previous = Array(0...b.count)
+  // Bounded loop: one row per character of the longer string, one column per the other.
+  for i in 1...a.count {
+    var current = [i] + Array(repeating: 0, count: b.count)
+    for j in 1...b.count {
+      current[j] = a[i - 1] == b[j - 1]
+        ? previous[j - 1]
+        : 1 + min(previous[j - 1], previous[j], current[j - 1])
+    }
+    previous = current
+  }
+  return previous[b.count]
+}
+
+func suggestion(for token: String, among candidates: [String]) -> String? {
+  let ranked = candidates
+    .map { ($0, editDistance(token, $0)) }
+    .filter { $0.1 <= 3 }
+    .sorted { $0.1 < $1.1 }
+  return ranked.first?.0
+}
+
+func unknownFlag(_ flag: String, among candidates: [String]) throws -> Never {
+  let hint = suggestion(for: flag, among: candidates).map { "did you mean '\($0)'?" } ?? "run 'friday --help'"
+  throw FridayError.usage("unknown option '\(flag)'; \(hint)")
+}
+
+// Values are required and validated here, so a typo cannot silently become a default.
+func value(_ iterator: inout IndexingIterator<[String]>, for flag: String) throws -> String {
+  guard let next = iterator.next() else {
+    throw FridayError.usage("\(flag) needs a value")
+  }
+  // A following flag means the value was forgotten; '-' alone is the stdin convention.
+  if next.hasPrefix("-"), next != "-", Float(next) == nil {
+    throw FridayError.usage("\(flag) needs a value, got '\(next)'")
+  }
+  return next
+}
+
+func number(_ iterator: inout IndexingIterator<[String]>, for flag: String, greaterThan minimum: Float) throws -> Float {
+  let raw = try value(&iterator, for: flag)
+  guard let parsed = Float(raw) else {
+    throw FridayError.usage("\(flag) needs a number, got '\(raw)'")
+  }
+  guard parsed > minimum else {
+    throw FridayError.usage("\(flag) must be greater than \(minimum), got '\(raw)'")
+  }
+  return parsed
+}
+
+func preset(_ iterator: inout IndexingIterator<[String]>, for flag: String) throws -> Int {
+  let raw = try value(&iterator, for: flag)
+  guard let parsed = Int(raw), (1...5).contains(parsed) else {
+    throw FridayError.usage("\(flag) needs 1 through 5, got '\(raw)'")
+  }
+  return parsed
 }
 
 func parseSpeakOptions(_ arguments: [String]) throws -> SpeakOptions {
@@ -35,32 +110,34 @@ func parseSpeakOptions(_ arguments: [String]) throws -> SpeakOptions {
     switch argument {
     case "-h", "--help": options.showHelp = true
     case "-l", "--list": options.listVoices = true
-    case "-v", "--voice": options.voice = iterator.next()
-    case "--language": options.language = iterator.next()
-    case "--generation": options.generation = iterator.next()
+    case "-v", "--voice": options.voice = try value(&iterator, for: argument)
+    case "--language": options.language = try value(&iterator, for: argument)
+    case "--generation": options.generation = try value(&iterator, for: argument)
     case "--standard", "--legacy": options.forceStandard = true
     case "--expressive": options.forceExpressive = true
-    case "--pace":
-      guard let value = iterator.next(), let parsed = Int(value) else { throw FridayError.usage("--pace needs 1 through 5") }
-      options.pace = parsed
-    case "--expressivity":
-      guard let value = iterator.next(), let parsed = Int(value) else { throw FridayError.usage("--expressivity needs 1 through 5") }
-      options.expressivity = parsed
-    case "-r", "--rate": options.rate = Float(iterator.next() ?? "") ?? 1.0
-    case "--pitch": options.pitch = Float(iterator.next() ?? "") ?? 1.0
-    case "--volume": options.volume = Float(iterator.next() ?? "") ?? 1.0
-    case "-o", "--out": options.outputPath = iterator.next()
+    case "--pace": options.pace = try preset(&iterator, for: argument)
+    case "--expressivity": options.expressivity = try preset(&iterator, for: argument)
+    case "-r", "--rate": options.rate = try number(&iterator, for: argument, greaterThan: 0)
+    case "--pitch": options.pitch = try number(&iterator, for: argument, greaterThan: 0)
+    case "--volume": options.volume = try number(&iterator, for: argument, greaterThan: 0)
+    case "-o", "--out": options.outputPath = try value(&iterator, for: argument)
     case "--timings": options.timingsToStdout = true
-    case "--timings-out": options.timingsPath = iterator.next()
+    case "--timings-out": options.timingsPath = try value(&iterator, for: argument)
     case "--prewarm": options.prewarm = true
     case "--chunked": options.chunked = true
     case "--no-chunked": options.chunked = false
+    case "--lossless": options.lossless = true
+    case "--fast": options.lossless = false
     case "-q", "--quiet": options.quiet = true
-    case "--completions": options.completionsShell = iterator.next()
+    case "--completions": options.completionsShell = try value(&iterator, for: argument)
     case "--man": options.showMan = true
     case "--skill": options.showSkill = true
+    case "--debug": options.debug = true
     case "--": while let rest = iterator.next() { positionals.append(rest) }
-    default: positionals.append(argument)
+    default:
+      // A leading dash is a flag we do not know, never text to speak.
+      if argument.hasPrefix("-"), argument != "-" { try unknownFlag(argument, among: speakFlags) }
+      positionals.append(argument)
     }
   }
   let joined = positionals.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -74,12 +151,18 @@ func parseSpeakOptions(_ arguments: [String]) throws -> SpeakOptions {
 }
 
 func fail(_ error: Error) -> Never {
-  if let fridayError = error as? FridayError {
-    FileHandle.standardError.write("friday: \(fridayError.description)\n".data(using: .utf8)!)
-    exit(fridayError.exitCode)
+  guard let fridayError = error as? FridayError else {
+    FileHandle.standardError.write(
+      "friday: unexpected failure: \(error); re-run with --debug to see the stages\n".data(using: .utf8)!)
+    exit(1)
   }
-  FileHandle.standardError.write("friday: \(error)\n".data(using: .utf8)!)
-  exit(1)
+  // Ctrl-C is the user interrupting, not an error to explain.
+  if case .cancelled = fridayError { exit(fridayError.exitCode) }
+  FileHandle.standardError.write("friday: \(fridayError.description)\n".data(using: .utf8)!)
+  if fridayError.exitCode == 1 {
+    FileHandle.standardError.write("friday: re-run with --debug to see the stages\n".data(using: .utf8)!)
+  }
+  exit(fridayError.exitCode)
 }
 
 func runSpeak(_ arguments: [String], config: FridayConfig) throws {
@@ -123,6 +206,7 @@ func runSpeak(_ arguments: [String], config: FridayConfig) throws {
     usingBuiltInDefault: usingBuiltInDefault
   )
   let chunkSentences = options.chunked ?? config.sentenceChunking ?? FridayConfig.builtInSentenceChunking
+  let lossless = options.lossless ?? config.lossless ?? FridayConfig.builtInLossless
   let pace = options.pace ?? config.pace ?? 3
   let expressivity = options.expressivity ?? config.expressivity ?? 3
   let synthesizer = Synthesizer(catalog: catalog)
@@ -142,7 +226,8 @@ func runSpeak(_ arguments: [String], config: FridayConfig) throws {
   }
 
   guard let text = options.text, !text.isEmpty else {
-    throw FridayError.usage(usageText)
+    // Concise by default; the full listing is one flag away.
+    throw FridayError.usage(conciseUsageText)
   }
 
   let wantsTimings = options.timingsToStdout || options.timingsPath != nil
@@ -157,7 +242,8 @@ func runSpeak(_ arguments: [String], config: FridayConfig) throws {
     volume: options.volume,
     wantsTimings: wantsTimings,
     playback: options.outputPath == nil,
-    chunkSentences: chunkSentences
+    chunkSentences: chunkSentences,
+    lossless: lossless
   )
 
   if let outputPath = options.outputPath {
@@ -190,7 +276,9 @@ func runSpeak(_ arguments: [String], config: FridayConfig) throws {
     let chunkLabel = outcome.chunkCount > 1 ? " chunks=\(outcome.chunkCount)" : ""
     // The daemon alternates lossless PCM and ~50 kbps Opus on its own; say which
     // one happened instead of letting the difference reach the ear unexplained.
-    let codecLabel = outcome.sourceFormat.contains("opus") ? " codec=lossy" : ""
+    let codecLabel = outcome.sourceFormat.contains("opus")
+      ? (lossless ? " codec=lossy(requested lossless)" : " codec=lossy")
+      : ""
     FileHandle.standardError.write(String(
       format: "voice=%@ [%@] %@ src=%@ first_audio=%.0fms synthesis=%.2fs audio=%.2fs%@%@%@\n",
       outcome.voiceName as NSString, outcome.language as NSString, generationLabel as NSString,
@@ -200,8 +288,30 @@ func runSpeak(_ arguments: [String], config: FridayConfig) throws {
   }
 }
 
-let config = FridayConfig.load()
+Debug.enableFromEnvironment()
 let arguments = Array(CommandLine.arguments.dropFirst())
+if arguments.contains("--debug") { Debug.enable() }
+Debug.stage("start", "friday pid=\(getpid()) log=\(Debug.sinkDescription) args=\(arguments.count)")
+
+let config: FridayConfig
+do {
+  config = try FridayConfig.load()
+  Debug.stage("config", "\(FridayConfig.fileURL.path) \(FileManager.default.fileExists(atPath: FridayConfig.fileURL.path) ? "loaded" : "absent, using built-ins") voice=\(config.defaultVoice ?? FridayConfig.builtInVoice) generation=\(config.defaultGeneration ?? FridayConfig.builtInGeneration)")
+} catch {
+  fail(error)
+}
+
+// Only a lone token can be a mistyped subcommand: "friday server is down" is a
+// sentence to speak, not a bad invocation of "serve".
+if arguments.count == 1,
+   let candidate = arguments.first,
+   !candidate.hasPrefix("-"),
+   !subcommands.contains(candidate),
+   suggestion(for: candidate, among: subcommands) != nil {
+  // Looks like a mistyped subcommand: say so rather than speaking it aloud as text.
+  fail(FridayError.usage(
+    "unknown command '\(candidate)'; did you mean '\(suggestion(for: candidate, among: subcommands)!)'? run 'friday --help'"))
+}
 
 if let subcommand = arguments.first, ["serve", "voices", "config"].contains(subcommand) {
   let rest = Array(arguments.dropFirst())

@@ -35,23 +35,34 @@ func isPlausibleFormat(_ asbd: AudioStreamBasicDescription) -> Bool {
   return true
 }
 
+// One code per class of thing you would debug differently. 0 is success and 130 is the
+// shell convention for SIGINT; 1 stays reserved for a failure we did not anticipate.
+// The command-line guidelines ask for non-zero codes mapped to the important failure
+// modes rather than one generic error, which is what this does.
 enum FridayError: Error, CustomStringConvertible {
   case daemonUnavailable
-  case unknownVoice(String)
+  case unknownVoice(String, suggestion: String?)
   case synthesisFailed(String)
-  case timeout
-  case nothingCaptured
+  case timeout(stage: String, seconds: Double)
+  case nothingCaptured(chunks: Int, formats: String)
+  case audioOutput(String)
   case usage(String)
   case config(String)
   case cancelled
 
   var description: String {
     switch self {
-    case .daemonUnavailable: return "sirittsd is not available on this system"
-    case .unknownVoice(let name): return "no installed voice matches '\(name)'; run 'friday voices'"
+    case .daemonUnavailable:
+      return "cannot reach sirittsd (SiriTTSService); check: launchctl print gui/\(getuid())/com.apple.sirittsd"
+    case .unknownVoice(let name, let suggestion):
+      let hint = suggestion.map { "; did you mean '\($0)'?" } ?? ""
+      return "no installed voice matches '\(name)'\(hint); run 'friday voices' for the list"
     case .synthesisFailed(let reason): return "synthesis failed: \(reason)"
-    case .timeout: return "synthesis timed out"
-    case .nothingCaptured: return "no audio captured"
+    case .timeout(let stage, let seconds):
+      return "timed out after \(Int(seconds))s waiting for \(stage)"
+    case .nothingCaptured(let chunks, let formats):
+      return "produced no audio from \(chunks) request(s); daemon formats seen: \(formats.isEmpty ? "none" : formats)"
+    case .audioOutput(let reason): return reason
     case .usage(let text): return text
     case .config(let text): return text
     case .cancelled: return "cancelled"
@@ -60,12 +71,14 @@ enum FridayError: Error, CustomStringConvertible {
 
   var exitCode: Int32 {
     switch self {
-    case .usage, .config: return 2
+    case .usage: return 2
     case .daemonUnavailable: return 3
     case .unknownVoice: return 4
+    case .config: return 5
     case .synthesisFailed: return 6
     case .timeout: return 7
     case .nothingCaptured: return 8
+    case .audioOutput: return 9
     case .cancelled: return 130
     }
   }
@@ -76,7 +89,9 @@ func wavData(samples: [Float], sampleRate: Double) throws -> Data {
   guard sampleRate >= 8000, sampleRate <= 192000 else {
     throw FridayError.config("implausible sample rate: \(sampleRate)")
   }
-  guard !samples.isEmpty else { throw FridayError.nothingCaptured }
+  guard !samples.isEmpty else {
+    throw FridayError.nothingCaptured(chunks: 0, formats: "")
+  }
   let pcm = pcmData(samples: samples)
   let integerRate = Int(sampleRate)
   let blockAlign = 2

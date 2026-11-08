@@ -8,6 +8,7 @@ struct FridayConfig: Codable {
   var pace: Int?
   var expressivity: Int?
   var sentenceChunking: Bool?
+  var lossless: Bool?
 
   static var fileURL: URL {
     if let override = ProcessInfo.processInfo.environment["FRIDAY_CONFIG"], !override.isEmpty {
@@ -18,12 +19,52 @@ struct FridayConfig: Codable {
       .appendingPathComponent("config.json")
   }
 
-  static func load() -> FridayConfig {
-    guard let data = try? Data(contentsOf: fileURL),
-          let decoded = try? JSONDecoder().decode(FridayConfig.self, from: data) else {
-      return FridayConfig()
+  // A missing file is normal. A file that exists but cannot be read or parsed is an
+  // error: silently falling back to built-ins means editing the config has no visible
+  // effect, which is the hardest kind of bug to find.
+  static func load() throws -> FridayConfig {
+    guard FileManager.default.fileExists(atPath: fileURL.path) else { return FridayConfig() }
+    let data: Data
+    do {
+      data = try Data(contentsOf: fileURL)
+    } catch {
+      throw FridayError.config("cannot read config \(fileURL.path): \(error.localizedDescription); fix it or delete it")
     }
-    return decoded
+    guard !data.isEmpty else { return FridayConfig() }
+    do {
+      return try JSONDecoder().decode(FridayConfig.self, from: data)
+    } catch {
+      throw FridayError.config(
+        "cannot use config \(fileURL.path): \(describeDecoding(error)); fix it, or run 'friday config reset'"
+      )
+    }
+  }
+
+  // DecodingError's default text is useless for debugging a hand-edited file, so the
+  // key path and the offending value are pulled out explicitly.
+  private static func describeDecoding(_ error: Error) -> String {
+    guard let decoding = error as? DecodingError else { return error.localizedDescription }
+    switch decoding {
+    case .typeMismatch(let type, let context):
+      return "key '\(keyPath(context))' has the wrong type (\(type)); \(describe(context.debugDescription))"
+    case .valueNotFound(let type, let context):
+      return "key '\(keyPath(context))' needs a \(type) value; \(describe(context.debugDescription))"
+    case .keyNotFound(let key, let context):
+      return "required key '\(key.stringValue)' is missing at \(keyPath(context))"
+    case .dataCorrupted(let context):
+      return "malformed JSON at \(keyPath(context)); \(context.debugDescription)"
+    @unknown default:
+      return "unrecognised decoding error"
+    }
+  }
+
+  private static func keyPath(_ context: DecodingError.Context) -> String {
+    let path = context.codingPath.map(\.stringValue).joined(separator: ".")
+    return path.isEmpty ? "root" : path
+  }
+
+  private static func describe(_ text: String) -> String {
+    text.split(separator: "\n").first.map(String.init) ?? text
   }
 
   func save() throws {
@@ -42,6 +83,9 @@ struct FridayConfig: Codable {
   // lossless encoder and lower time-to-first-word on long answers. It is a bias,
   // not a guarantee; the codec stays the daemon's choice either way.
   static let builtInSentenceChunking = true
+
+  // Lossless by default: the compressed path is what made the voice sound wrong.
+  static let builtInLossless = true
 
   static func normalizeGeneration(_ raw: String) -> String? {
     switch raw.lowercased() {

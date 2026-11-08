@@ -20,7 +20,9 @@ final class VoiceCatalog {
       list = found
       filled.signal()
     }
-    guard pumpRunLoop(filled, timeout: 20) else { throw FridayError.timeout }
+    guard pumpRunLoop(filled, timeout: 20) else {
+      throw FridayError.timeout(stage: "the voice inventory from sirittsd", seconds: 20)
+    }
     return VoiceCatalog(session: session, voices: list)
   }
 
@@ -58,9 +60,21 @@ final class VoiceCatalog {
     }
   }
 
+  // Nearest installed name, so a typo reports the fix instead of just failing.
+  func suggestion(for name: String) -> String? {
+    let lowered = name.lowercased()
+    let ranked = voices
+      .compactMap { ($0.name, editDistance(lowered, ($0.name ?? "").lowercased())) }
+      .filter { $0.1 <= 3 }
+      .sorted { $0.1 < $1.1 }
+    return ranked.first?.0
+  }
+
   func resolve(name: String?, language: String?, config: FridayConfig) throws -> SynthesisVoice {
     if let name {
-      guard let match = find(name: name) else { throw FridayError.unknownVoice(name) }
+      guard let match = find(name: name) else {
+        throw FridayError.unknownVoice(name, suggestion: suggestion(for: name))
+      }
       return match
     }
     if let language, let match = voices.first(where: { $0.language.lowercased().hasPrefix(language.lowercased()) }) {

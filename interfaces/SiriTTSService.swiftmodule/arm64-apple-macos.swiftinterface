@@ -71,4 +71,8 @@ public class DaemonSession : Foundation.NSObject {
     reply: @escaping (Swift.Bool) -> Swift.Void
   )
   public func cancel(request: SiriTTSService.BaseRequest)
+  // Undocumented but present (v16@0:8). Dropping the daemon's compiled-audio cache
+  // puts the next synthesis back on its lossless batch encoder, which otherwise
+  // degrades to ~50 kbps Opus once the daemon has warmed up.
+  public func clearDeviceCache()
 }

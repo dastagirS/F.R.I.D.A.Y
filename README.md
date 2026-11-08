@@ -86,12 +86,32 @@ byte-identical audio, and `disableCompactVoice`, `forceOspreyTTS`,
 `synthesisProfile` and `synthesisPriority` change nothing. At ~50 kbps the voice
 sounds thinner, which is what was heard first and measured second.
 
-So `friday` sends one sentence per request by default: small requests land on the
-lossless encoder far more often, and the first word plays while later sentences
-are still rendering. This is a bias, not a guarantee — the daemon can answer
-lossy anyway, and it does so silently. `src=` shows the real format and
-`codec=lossy` appears on stderr when it happened, so trust the output rather than
-the expectation. The cost is a little cross-sentence prosody.
+The lever that actually works is `clearDeviceCache()` — a private no-argument
+method on `DaemonSession` that costs 0.00 s and puts the next synthesis back on
+the lossless encoder:
+
+```
+warm daemon, plain request            opus   synthesis 0.02s
+clearDeviceCache(), then request      lpcm   synthesis 0.45s   <- 3/3 repeats
+warm session held open, no clearing   opus   even after 120s idle
+```
+
+Warming the session is not a fix; it locks the daemon into the lossy mode. So
+`friday` clears the cache before each request by default:
+
+```bash
+friday --lossless "default"      # explicit
+friday --fast "accept opus"      # ~0.2s less synthesis per sentence
+friday config set lossless off
+```
+
+Measured cost, four-sentence paragraph: lossless `lpcm` throughout in 2.20 s of
+synthesis with first audio at 70 ms, versus mixed `lpcm`/`opus` in 1.65 s with
+first audio at 44 ms. Renders report `src=` and `codec=lossy`, so the format is
+visible rather than left to the ear.
+
+`friday` also sends one sentence per request, so the first word plays while later
+sentences are still rendering. The cost is a little cross-sentence prosody.
 
 ```bash
 friday --chunked "default"        # explicit
@@ -122,6 +142,44 @@ Two things worth knowing:
   still delivering timings), so the delivered set decides the flag.
 - End times are derived from the next word's start, so every entry carries
   `endDerived: true`.
+
+## Debugging
+
+Failures print one line on stderr: what failed, why, and the next step. Nothing that
+matters is silent — an unparsable flag is an error rather than text to speak, a bad
+numeric value is rejected rather than defaulted, and a config file that exists but
+cannot be parsed stops the run instead of quietly falling back to built-ins.
+
+```bash
+friday --debug "text"                        # stage trace on stderr
+FRIDAY_DEBUG=1 friday propose "text"         # same, for a service or script
+FRIDAY_DEBUG=1 FRIDAY_DEBUG_LOG=/tmp/f.log friday serve   # capture without the terminal
+```
+
+The trace covers config resolution, the resolved voice and asset key, which session and
+render path was chosen, per-request source format and frame counts, any chunk that fails
+to decode, and the playback drain.
+
+Exit codes name the class of failure, so a script can branch without parsing text:
+
+| code | meaning |
+|---:|---|
+| 0 | success |
+| 1 | unexpected failure (re-run with `--debug`) |
+| 2 | bad usage: unknown flag/subcommand, or invalid value |
+| 3 | sirittsd unreachable |
+| 4 | unknown voice (message suggests the nearest installed name) |
+| 5 | config file unreadable or unparsable (message names file and key) |
+| 6 | synthesis failed |
+| 7 | timeout (message names stage and seconds) |
+| 8 | no audio produced |
+| 9 | output failed (file write, audio engine, or system helper) |
+| 130 | cancelled with Ctrl-C, printed as nothing |
+
+Over HTTP, failures use the OpenAI envelope `{"error": {"message", "type", "param",
+"code"}}` with codes like `unknown_voice`, `invalid_json`, `daemon_unavailable`,
+`timeout`, and every response carries `X-Request-Id`, which also appears in the server's
+debug log.
 
 ## How it works
 
@@ -199,8 +257,10 @@ Sources/friday/Util.swift        errors, WAV encoding, run-loop pump
 Exercised end to end on macOS 27.2: CLI defaults and overrides, word timings
 (including a 44-word sentence, which previously lost 28 words), timings to file,
 prewarm, all config verbs, voice list/status/available/default, purge dry-run,
-ambiguity and unknown-voice refusals, completion scripts (zsh and bash pass their
-own syntax checkers), man page, skill file, exit codes, and every HTTP route
+ambiguity and unknown-voice refusals, every failure path (typo'd flags, unknown
+subcommands, bad numeric values, missing values, corrupt config, unknown voice),
+completion scripts (zsh and bash pass their
+own syntax checkers), man page, skill file, and every HTTP route
 including bearer auth. Sentence splitting is checked against seven boundary
 cases (abbreviations, decimals, quoted endings, ellipsis, no terminator), and
 timings are verified to map back onto the original text after chunking. Audio
