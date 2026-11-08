@@ -293,27 +293,42 @@ Sources/FridayCore/TextChunker.swift   sentence splitting, whole-string + stream
 Sources/FridayCore/Config.swift        persisted defaults
 Sources/FridayCore/Util.swift          errors, WAV encoding, run-loop pump
 Sources/FridayCore/Debug.swift         stage tracing
-Tests/CoreTests/main.swift         checks for FridayCore (no daemon needed)
-Tests/blackbox.sh                  CLI and HTTP behaviour of the built binary
-Tests/audio.sh                     real synthesis, timings, clipping measurement
-test.sh                            runs the tiers
+Sources/FridayCore/TextDecoder.swift   incremental UTF-8 across reads
+Package.swift                      one target, one test target
+Tests/FridayTests/CoreTests.swift  logic: chunking, taxonomy, config, WAV, UTF-8
+Tests/FridayTests/BinaryTests.swift CLI, config files, HTTP routes, auth, SIGINT
+Tests/FridayTests/AudioTests.swift real synthesis and streaming (opt-in)
+Tests/FridayTests/Support.swift    binary runner, HTTP and WAV helpers
 ```
 
-`FridayCore` is compiled into the binary and compiled again by the tests, so the code
-under test is the code that ships rather than a copy.
+One executable target holds both source directories, so the tests reach the logic with
+`@testable import friday` — the code under test is the code that ships, without the
+library needing a `public` surface it does not otherwise want.
 
 ## Tests
 
 ```bash
-./test.sh           # core logic, no daemon, no audio (mostly the build)
-./test.sh --server  # adds CLI + HTTP black-box checks
-./test.sh --audio   # adds real synthesis, timings, clipping measurement
-./test.sh --all     # all three
+./build.sh                      # SwiftPM, Command Line Tools
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+FRIDAY_AUDIO_TESTS=1 DEVELOPER_DIR=… swift test   # adds real synthesis
+swift test --filter ChunkingTests                # one area
 ```
 
-190 checks in about 15 s for `--all`. The tiers are split by what they cost: the
-default tier needs no daemon and makes no sound, the audio tier synthesises real
-speech and is therefore opt-in.
+64 tests in about 5 s, or 14 audio tests in 8 s on top. The audio tests skip themselves
+unless `FRIDAY_AUDIO_TESTS=1`, because they need the daemon, this machine's voice
+assets, and they make sound.
+
+**Why `DEVELOPER_DIR`.** XCTest is an Xcode component: Command Line Tools ships the
+compiler and SDK but no `XCTest.framework`, so plain `swift test` against CLT fails with
+`unable to resolve module dependency: 'XCTest'` — a long-standing limitation, not a
+project setting ([explanation](https://forums.swift.org/t/will-swift-testing-allow-testing-w-o-xcode-on-macos/73843)).
+Swift Testing is no escape here either: CLT has `Testing.framework` but its macro plugin
+fails to load. `DEVELOPER_DIR` is Apple's documented per-invocation pointer to a
+developer directory, and pointing it at Xcode makes both frameworks available with no
+`sudo` and no `xcode-select` change. For anyone who would rather not type it, one-time
+`sudo xcode-select --switch /Applications/Xcode.app` makes plain `swift test` work.
+Building never needs Xcode — only testing does. (`swift test --toolchain …` does not work
+here; it mixes CLT and Xcode dylibs and still cannot find XCTest.)
 
 The suite is deliberately local. There is no CI: `friday` synthesises through an
 undocumented private framework and per-machine voice assets, so a GitHub runner could
@@ -326,7 +341,7 @@ stream that hung on a stalled producer all survived to be found by hand.
 
 ## Verification status
 
-Now covered by the committed suite above: sentence splitting against the boundary
+Covered by the suite above: sentence splitting against the boundary
 cases (abbreviations, decimals, quoted endings, ellipsis, no terminator, UTF-16
 offsets), streaming buffer behaviour including bounded forced splits, the exit-code
 taxonomy, config round trips and rejections, WAV header layout and PCM clamping, the
@@ -338,8 +353,9 @@ chunked paragraphs, timings, and refusal paths.
 Written while building the suite, both confirmed by reading the code and recorded as
 ticket #43: `--generation theatrical` is silently ignored instead of refused, and
 `--help` omits `--skill` even though the usage text, man page and completions all
-document it. `Tests/blackbox.sh` pins the current silent behaviour with a comment
-pointing at the ticket, so the gap stays visible rather than forgotten.
+document it. `Tests/FridayTests/BinaryTests.swift` pins today's silent behaviour in a
+test named after the gap, so it stays visible rather than forgotten — and fails loudly
+when the ticket lands and the expectation needs flipping.
 
 Exercised end to end on macOS 27.2: CLI defaults and overrides, word timings
 (including a 44-word sentence, which previously lost 28 words), timings to file,
@@ -369,8 +385,7 @@ Not verified, deliberately or unavoidably:
 ## Build
 
 ```bash
-./build.sh      # swiftc; needs Command Line Tools with the macOS 26+ SDK
-./test.sh       # build, then the checks
+./build.sh      # swift build -c release, then copies the product to ./friday
 ```
 
 ## Caveats
