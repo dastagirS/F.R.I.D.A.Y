@@ -1,11 +1,18 @@
 import CoreAudioTypes
 import Foundation
 
-func pumpRunLoop(_ semaphore: DispatchSemaphore, timeout: TimeInterval) -> Bool {
+// Waiting on the main thread is also the only chance to service things that arrive while
+// a request runs, so `tick` is called on every slice (used by the server to answer /stop).
+func pumpRunLoop(
+  _ semaphore: DispatchSemaphore,
+  timeout: TimeInterval,
+  tick: (() -> Void)? = nil
+) -> Bool {
   let deadline = Date().addingTimeInterval(timeout)
   while Date() < deadline {
     if semaphore.wait(timeout: .now()) == .success { return true }
     RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+    tick?()
   }
   return false
 }
@@ -41,6 +48,7 @@ func isPlausibleFormat(_ asbd: AudioStreamBasicDescription) -> Bool {
 // modes rather than one generic error, which is what this does.
 enum FridayError: Error, CustomStringConvertible {
   case daemonUnavailable
+  case serverUnreachable(String)
   case unknownVoice(String, suggestion: String?)
   case synthesisFailed(String)
   case timeout(stage: String, seconds: Double)
@@ -55,6 +63,8 @@ enum FridayError: Error, CustomStringConvertible {
     switch self {
     case .daemonUnavailable:
       return "cannot reach sirittsd (SiriTTSService); check: launchctl print gui/\(getuid())/com.apple.sirittsd"
+    case .serverUnreachable(let detail):
+      return "cannot reach the friday server: \(detail); is 'friday serve' running?"
     case .unknownVoice(let name, let suggestion):
       let hint = suggestion.map { "; did you mean '\($0)'?" } ?? ""
       return "no installed voice matches '\(name)'\(hint); run 'friday voices' for the list"
@@ -75,7 +85,7 @@ enum FridayError: Error, CustomStringConvertible {
   var exitCode: Int32 {
     switch self {
     case .usage: return 2
-    case .daemonUnavailable: return 3
+    case .daemonUnavailable, .serverUnreachable: return 3
     case .unknownVoice: return 4
     case .config: return 5
     case .synthesisFailed: return 6

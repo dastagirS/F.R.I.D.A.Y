@@ -39,7 +39,7 @@ let speakFlags: [String] = [
   "--chunked", "--no-chunked", "--lossless", "--fast", "-q", "--quiet", "--completions",
   "--man", "--skill", "--debug"
 ]
-let subcommands = ["serve", "voices", "config"]
+let subcommands = ["serve", "stop", "voices", "config"]
 
 // Edit distance, used only to suggest a correction for a mistyped flag or subcommand.
 func editDistance(_ left: String, _ right: String) -> Int {
@@ -249,6 +249,7 @@ func runSpeak(_ arguments: [String], config: FridayConfig) throws {
   }
 
   let wantsTimings = options.timingsToStdout || options.timingsPath != nil
+  synthesizer.beginRequest()
   let outcome = try synthesizer.synthesize(
     text: text,
     voice: voice,
@@ -331,11 +332,12 @@ if arguments.count == 1,
     "unknown command '\(candidate)'; did you mean '\(suggestion(for: candidate, among: subcommands)!)'? run 'friday --help'"))
 }
 
-if let subcommand = arguments.first, ["serve", "voices", "config"].contains(subcommand) {
+if let subcommand = arguments.first, ["serve", "stop", "voices", "config"].contains(subcommand) {
   let rest = Array(arguments.dropFirst())
   do {
     switch subcommand {
     case "serve": try runServe(rest, config: config)
+    case "stop": try runStop(rest)
     case "voices": try runVoices(rest, config: config)
     default: try runConfig(rest, config: config)
     }

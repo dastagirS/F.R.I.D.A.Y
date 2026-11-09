@@ -7,6 +7,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 swift build -c release --product friday
-cp .build/release/friday friday
-chmod +x friday
+# Copy next to the destination and rename: an interrupted copy used to leave a truncated
+# binary on PATH that the kernel kills on exec with no diagnostic.
+cp .build/release/friday friday.new
+chmod +x friday.new
+mv friday.new friday
 echo "built $PWD/friday"

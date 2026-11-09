@@ -266,6 +266,29 @@ func audioLevels(wav: Data) -> (sampleRate: Int, channels: Int, bits: Int, frame
   return (sampleRate, channels, bits, sampleCount / max(1, channels), Double(peak) / 32768.0, rms)
 }
 
+
+/// A port that was free a moment ago. Used by tests that need "nothing is listening"
+/// without racing a real service on a fixed number.
+func unusedPort() -> Int {
+  let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+  guard descriptor >= 0 else { return 9 }
+  defer { Darwin.close(descriptor) }
+  var address = sockaddr_in()
+  address.sin_family = sa_family_t(AF_INET)
+  address.sin_addr.s_addr = inet_addr("127.0.0.1")
+  address.sin_port = 0
+  let size = socklen_t(MemoryLayout<sockaddr_in>.size)
+  _ = withUnsafePointer(to: &address) { pointer in
+    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(descriptor, $0, size) }
+  }
+  var actual = sockaddr_in()
+  var actualSize = size
+  _ = withUnsafeMutablePointer(to: &actual) { pointer in
+    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &actualSize) }
+  }
+  return Int(UInt16(bigEndian: actual.sin_port))
+}
+
 func chunkTexts(_ text: String) -> [String] {
   TextChunker.chunks(from: text).map(\.text)
 }
@@ -333,6 +356,20 @@ final class RawHTTPClient {
   }
 
   /// Sends one chunked request and returns the whole raw response.
+  // Sends the request head and one chunk, then hands control back so a test can do
+  // something else (a stop) while the server is still waiting for the rest of the body.
+  func beginChunkedRequest(path: String, body: Data) throws {
+    var head = "POST \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+    head += "Transfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n"
+    try write(Data(head.utf8))
+    try write(Data(String(body.count, radix: 16).utf8) + Data("\r\n".utf8) + body + Data("\r\n".utf8))
+  }
+
+  func finishChunkedRequest() throws -> Data {
+    try write(Data("0\r\n\r\n".utf8))
+    return try readToEnd()
+  }
+
   func chunkedRequest(path: String, first: Data, second: Data = Data(), delayBeforeSecond: TimeInterval = 0) throws -> Data {
     var head = "POST \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\n"
     head += "Transfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n"

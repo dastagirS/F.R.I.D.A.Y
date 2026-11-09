@@ -2,8 +2,10 @@ import Foundation
 import SiriTTSService
 
 // Minimal HTTP/1.1 server: no dependencies, one request at a time, loopback by
-// default. Everything runs on the main thread because sirittsd delivers its
-// callbacks on the main run loop.
+// default. Requests are handled on the main thread, but the daemon answers on its
+// own threads and signals a semaphore; the main thread pumps its run loop while it
+// waits so that signal sources and timers still fire. Serialisation therefore comes
+// from this accept loop, not from thread affinity.
 final class HTTPServer {
   private let port: UInt16
   private let host: String
@@ -15,6 +17,11 @@ final class HTTPServer {
   // Requests are handled one at a time on the main run loop, so a single current id is
   // sufficient and lets every response and log line agree on it.
   private var currentRequestId = "--------"
+  // Kept so a stop can be accepted from inside the wait loop of a running request.
+  private var listener: Int32 = -1
+  // The most recent request, so a stop that arrives after it finished can still say which
+  // one it cancelled (playback outlives the response).
+  private var lastRequestId: String?
 
   init(port: UInt16, host: String, token: String?, synthesizer: Synthesizer, catalog: VoiceCatalog, config: FridayConfig) {
     self.port = port
@@ -49,6 +56,7 @@ final class HTTPServer {
       FileHandle.standardError.write("warning: serving on \(host) without --auth-token-env exposes Siri's voice to your network\n".data(using: .utf8)!)
     }
     FileHandle.standardError.write("friday serving on http://\(host):\(port) (\(catalog.voices.count) voices)\n".data(using: .utf8)!)
+    listener = descriptor
 
     while true {
       let client = accept(descriptor, nil, nil)
@@ -65,6 +73,114 @@ final class HTTPServer {
     }
   }
 
+  // Nothing is in flight here (the accept loop is free), so this only reaches playback
+  // that outlived its response. A request id, when given, still has to match.
+  private func handleStop(_ request: HTTPRequest, client: Int32, last: String?) {
+    var requested: String?
+    if request.isChunked {
+      let reader = ChunkedBodyReader(client: client, initial: request.body, limit: 4096, requestId: currentRequestId)
+      guard let buffered = reader.readAll() else {
+        respondError(client, status: 400, type: "invalid_request_error",
+                     message: "stop body could not be read", code: "invalid_body")
+        return
+      }
+      requested = stopTarget(in: buffered)
+    } else {
+      requested = stopTarget(in: request.body)
+    }
+    guard let last else {
+      respondJSON(client, 200, ["stopped": false, "reason": "no request has run yet"])
+      return
+    }
+    if let requested, requested != last {
+      respondError(
+        client, status: 409, type: "invalid_request_error",
+        message: "request '\(requested)' is not the most recent one (last: '\(last)')",
+        param: "request_id", code: "request_mismatch"
+      )
+      return
+    }
+    synthesizer.cancelActive()
+    respondJSON(client, 200, ["stopped": true, "request_id": last])
+    Debug.stage("http", "\(currentRequestId) stop accepted for finished request \(last)")
+  }
+
+  // A request can take minutes, so a stop cannot queue behind the accept loop it is meant
+  // to interrupt. The listener is polled on each slice of the wait loop a running request
+  // spends blocked, which keeps this on one thread: no chasing the main thread, and no
+  // window where a fast follow-up request is refused because the previous one is still
+  // finishing its bookkeeping.
+  private func pollForControl() {
+    guard listener >= 0 else { return }
+    var descriptor = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
+    guard poll(&descriptor, 1, 0) > 0 else { return }
+    let control = accept(listener, nil, nil)
+    guard control >= 0 else { return }
+    var timeout = timeval(tv_sec: 5, tv_usec: 0)
+    setsockopt(control, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+    handleControl(control)
+    close(control)
+  }
+
+  // Only POST /stop is served while a request is in flight; anything else gets 503
+  // instead of waiting in the backlog for the current answer to finish.
+  private func handleControl(_ client: Int32) {
+    let identifier = currentRequestId
+    // The answer's own id: reporting the running request's id on a 503 would make the
+    // log read as if that request had produced the error.
+    let controlId = String(format: "%08x", UInt32.random(in: 0...UInt32.max))
+    guard let request = readRequest(client) else {
+      respondError(client, status: 400, type: "invalid_request_error",
+                   message: "malformed HTTP request", code: "malformed_request", requestId: controlId)
+      return
+    }
+    if let token, !token.isEmpty, request.headers["authorization"] != "Bearer \(token)" {
+      respondError(client, status: 401, type: "invalid_request_error",
+                   message: "missing or invalid bearer token; set Authorization: Bearer $TOKEN",
+                   code: "invalid_token", requestId: controlId)
+      return
+    }
+    guard request.method == "POST", request.path == "/stop" else {
+      respondError(
+        client, status: 503, type: "server_error",
+        message: "busy with request \(identifier); only POST /stop is served while a request runs",
+        code: "busy", requestId: controlId
+      )
+      return
+    }
+
+    var requested: String?
+    if request.isChunked {
+      let reader = ChunkedBodyReader(client: client, initial: request.body, limit: 4096, requestId: identifier)
+      guard let buffered = reader.readAll() else {
+        respondError(client, status: 400, type: "invalid_request_error",
+                     message: "stop body could not be read", code: "invalid_body", requestId: controlId)
+        return
+      }
+      requested = stopTarget(in: buffered)
+    } else {
+      requested = stopTarget(in: request.body)
+    }
+    if let requested, requested != identifier {
+      respondError(
+        client, status: 409, type: "invalid_request_error",
+        message: "request '\(requested)' is not in flight (active: '\(identifier)')",
+        param: "request_id", code: "request_mismatch", requestId: controlId
+      )
+      return
+    }
+
+    synthesizer.cancelActive()
+    Debug.stage("http", "\(identifier) stop accepted")
+    respondJSON(client, 200, ["stopped": true, "request_id": identifier], requestId: controlId)
+    FileHandle.standardError.write("friday: stopped request \(identifier)\n".data(using: .utf8)!)
+  }
+
+  private func stopTarget(in body: Data) -> String? {
+    guard !body.isEmpty, case .ok(let object) = parseJSON(body) else { return nil }
+    return object["request_id"] as? String
+  }
+
   private func handle(_ client: Int32) {
     currentRequestId = String(format: "%08x", UInt32.random(in: 0...UInt32.max))
     let started = Date()
@@ -73,6 +189,12 @@ final class HTTPServer {
       respondError(client, status: 400, type: "invalid_request_error",
                    message: "malformed HTTP request", code: "malformed_request")
       return
+    }
+    // Only routes that produce audio are worth remembering: a stop addresses speech, and a
+    // health check or the stop itself would otherwise shadow the id it is trying to name.
+    if request.path == "/v1/audio/speech" || request.path == "/say" {
+      lastRequestId = currentRequestId
+      synthesizer.beginRequest()
     }
     if let token, !token.isEmpty {
       guard request.headers["authorization"] == "Bearer \(token)" else {
@@ -85,7 +207,8 @@ final class HTTPServer {
     }
     if request.isChunked {
       let reader = ChunkedBodyReader(
-        client: client, initial: request.body, limit: 4 * 1024 * 1024, requestId: currentRequestId
+        client: client, initial: request.body, limit: 4 * 1024 * 1024, requestId: currentRequestId,
+        tick: { [weak self] in self?.pollForControl() }
       )
       if request.method == "POST", request.path == "/say" {
         handleSayStreaming(reader, client: client)
@@ -137,8 +260,7 @@ final class HTTPServer {
       handleSpeech(request, client: client)
 
     case ("POST", "/stop"):
-      synthesizer.cancelActive()
-      respondJSON(client, 200, ["stopped": true])
+      handleStop(request, client: client, last: lastRequestId)
 
     case ("POST", "/say"):
       handleSay(request, client: client)
@@ -201,7 +323,8 @@ final class HTTPServer {
         rate: max(0.25, min(4.0, speed)), pitch: 1.0, volume: 1.0,
         wantsTimings: false, playback: false,
         chunkSentences: config.sentenceChunking ?? FridayConfig.builtInSentenceChunking,
-        lossless: config.lossless ?? FridayConfig.builtInLossless
+        lossless: config.lossless ?? FridayConfig.builtInLossless,
+        whileWaiting: { [weak self] in self?.pollForControl() }
       )
       let body = format == "wav"
         ? try wavData(samples: outcome.samples, sampleRate: 48000)
@@ -277,6 +400,7 @@ final class HTTPServer {
         wantsTimings: false, playback: false,
         chunkSentences: config.sentenceChunking ?? FridayConfig.builtInSentenceChunking,
         lossless: config.lossless ?? FridayConfig.builtInLossless,
+        whileWaiting: { [weak self] in self?.pollForControl() },
         onAudio: { buffer in
           guard let channel = buffer.floatChannelData?[0] else { return }
           let samples = UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength))
@@ -287,6 +411,13 @@ final class HTTPServer {
       endChunkedResponse(client)
       Debug.stage("http", "\(currentRequestId) stream complete: \(framesWritten) frames, \(String(format: "%.2f", outcome.audioSeconds))s audio")
     } catch {
+      if let friday = error as? FridayError, case .cancelled = friday {
+        // A stop is not a failure: end the body properly so the client sees a valid,
+        // shorter response instead of a truncation it cannot tell from a crash.
+        endChunkedResponse(client)
+        Debug.stage("http", "\(currentRequestId) stopped after \(framesWritten) frames")
+        return
+      }
       // The status line is already on the wire, so the honest signal left is a
       // truncated body: no terminating chunk means the client knows it was cut off.
       Debug.stage("http", "\(currentRequestId) stream aborted after \(framesWritten) frames: \(error)")
@@ -321,7 +452,8 @@ final class HTTPServer {
       rate: 1.0, pitch: 1.0, volume: 1.0,
       wantsTimings: false, playback: true,
       chunkSentences: config.sentenceChunking ?? FridayConfig.builtInSentenceChunking,
-      lossless: config.lossless ?? FridayConfig.builtInLossless
+      lossless: config.lossless ?? FridayConfig.builtInLossless,
+      whileWaiting: { [weak self] in self?.pollForControl() }
     )
   }
 
@@ -475,12 +607,13 @@ final class HTTPServer {
     type: String,
     message: String,
     param: String? = nil,
-    code: String? = nil
+    code: String? = nil,
+    requestId: String? = nil
   ) {
     var body: [String: Any] = ["message": message, "type": type]
     body["param"] = param ?? NSNull()
     body["code"] = code ?? NSNull()
-    respondJSON(client, status, ["error": body])
+    respondJSON(client, status, ["error": body], requestId: requestId)
   }
 
   // MARK: - HTTP plumbing
@@ -505,12 +638,25 @@ final class HTTPServer {
     private(set) var totalRead = 0
 
     private let requestId: String
+    // Called between receive attempts so a stop stays answerable while this request is
+    // blocked waiting for its next chunk.
+    private let tick: (() -> Void)?
+    private var idleDeadline = Date()
 
-    init(client: Int32, initial: Data, limit: Int, requestId: String) {
+    private static let sliceTimeout = timeval(tv_sec: 0, tv_usec: 200_000)
+    private static let idleTimeout: TimeInterval = 300
+
+    init(client: Int32, initial: Data, limit: Int, requestId: String, tick: (() -> Void)? = nil) {
       self.client = client
       self.buffer = initial
       self.limit = limit
       self.requestId = requestId
+      self.tick = tick
+      if tick != nil {
+        var slice = ChunkedBodyReader.sliceTimeout
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &slice, socklen_t(MemoryLayout<timeval>.size))
+      }
+      idleDeadline = Date().addingTimeInterval(ChunkedBodyReader.idleTimeout)
     }
 
     // nil means "no more chunks": either a clean end or a protocol failure, which
@@ -562,10 +708,25 @@ final class HTTPServer {
       // allowed to send one large chunk, and refusing to buffer past 256 KB reset the
       // connection while readAll() still advertised 4 MB.
       if buffer.count > limit + 64 * 1024 { return false }
-      let received = recv(client, &scratch, scratch.count, 0)
-      guard received > 0 else { return false }
-      buffer.append(contentsOf: scratch[0..<received])
-      return true
+      while true {
+        let received = recv(client, &scratch, scratch.count, 0)
+        if received > 0 {
+          buffer.append(contentsOf: scratch[0..<received])
+          idleDeadline = Date().addingTimeInterval(ChunkedBodyReader.idleTimeout)
+          return true
+        }
+        // A timed-out receive means the producer paused, not that it is gone: keep the
+        // request alive, but only for a bounded idle period.
+        if received < 0, errno == EAGAIN, tick != nil {
+          guard Date() < idleDeadline else {
+            Debug.stage("http", "\(requestId) chunked body idle for \(Int(ChunkedBodyReader.idleTimeout))s")
+            return false
+          }
+          tick?()
+          continue
+        }
+        return false
+      }
     }
   }
 
@@ -631,17 +792,20 @@ final class HTTPServer {
     return .ok(dictionary)
   }
 
-  private func respondJSON(_ client: Int32, _ status: Int, _ payload: [String: Any]) {
+  private func respondJSON(_ client: Int32, _ status: Int, _ payload: [String: Any], requestId: String? = nil) {
     let data: Data
     do {
       data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
     } catch {
-      Debug.stage("http", "\(currentRequestId) cannot encode response: \(error)")
+      Debug.stage("http", "\(requestId ?? currentRequestId) cannot encode response: \(error)")
       let fallback = #"{"error":{"message":"cannot encode response","type":"server_error"}}"#
       respond(client, status: 500, reason: reason(for: 500), contentType: "application/json", body: Data(fallback.utf8))
       return
     }
-    respond(client, status: status, reason: reason(for: status), contentType: "application/json", body: data)
+    respond(
+      client, status: status, reason: reason(for: status),
+      contentType: "application/json", body: data, requestId: requestId
+    )
   }
 
   private func reason(for status: Int) -> String {
@@ -700,10 +864,20 @@ final class HTTPServer {
     sendAll(client, Data("0\r\n\r\n".utf8))
   }
 
-  private func respond(_ client: Int32, status: Int, reason: String, contentType: String, body: Data, extraHeaders: [String: String] = [:]) {
+  // `requestId` is only passed while a request runs, when a stop is answered mid-flight
+  // and must not borrow the running request's id for its own reply.
+  private func respond(
+    _ client: Int32,
+    status: Int,
+    reason: String,
+    contentType: String,
+    body: Data,
+    extraHeaders: [String: String] = [:],
+    requestId: String? = nil
+  ) {
     var head = "HTTP/1.1 \(status) \(reason)\r\n"
     head += "Content-Type: \(contentType)\r\n"
-    head += "X-Request-Id: \(currentRequestId)\r\n"
+    head += "X-Request-Id: \(requestId ?? currentRequestId)\r\n"
     head += "Content-Length: \(body.count)\r\n"
     head += "Connection: close\r\n"
     for (key, value) in extraHeaders.sorted(by: { $0.key < $1.key }) {

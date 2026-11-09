@@ -240,6 +240,10 @@ func runStreamingStdin(
   quiet: Bool
 ) throws {
   let synthesizer = Synthesizer(catalog: try VoiceCatalog.open())
+  // One request from the session's point of view: the cancel flag is cleared here, so a
+  // Ctrl-C during one sentence ends the whole stream instead of being cleared by the next
+  // synthesis.
+  synthesizer.beginRequest()
   // Ctrl-C while waiting for input cancels nothing in flight, so the wait itself has to
   // end: without this flag the loop keeps polling a producer that will never speak.
   var interrupted = false
@@ -325,6 +329,82 @@ func runStreamingStdin(
       spoken, audioSeconds, firstAudioMilliseconds, Date().timeIntervalSince(started)
     ).data(using: .utf8)!)
   }
+}
+
+// Barge-in for a request someone else started: a server, a script, a UI. The server
+// serves this while a request is in flight, so it does not queue behind the answer it
+// is cancelling.
+func runStop(_ arguments: [String]) throws {
+  var port: UInt16 = 8787
+  var host = "127.0.0.1"
+  var requestId: String?
+  var tokenEnvironmentName: String?
+  var iterator = arguments.makeIterator()
+  while let argument = iterator.next() {
+    switch argument {
+    case "--port":
+      guard let value = iterator.next(), let parsed = UInt16(value) else {
+        throw FridayError.usage("--port needs a number")
+      }
+      port = parsed
+    case "--host":
+      guard let value = iterator.next() else { throw FridayError.usage("--host needs a value") }
+      host = value
+    case "--request-id":
+      guard let value = iterator.next() else { throw FridayError.usage("--request-id needs a value") }
+      requestId = value
+    case "--auth-token-env":
+      guard let value = iterator.next() else { throw FridayError.usage("--auth-token-env needs a name") }
+      tokenEnvironmentName = value
+    case "--debug":
+      Debug.enable()
+    case "-h", "--help":
+      print(usageText)
+      exit(0)
+    default:
+      throw FridayError.usage("unknown option for stop: \(argument)")
+    }
+  }
+
+  guard let url = URL(string: "http://\(host):\(port)/stop") else {
+    throw FridayError.usage("invalid host '\(host)'")
+  }
+  var request = URLRequest(url: url)
+  request.httpMethod = "POST"
+  request.timeoutInterval = 10
+  request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+  var payload: [String: Any] = [:]
+  if let requestId { payload["request_id"] = requestId }
+  request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+  if let tokenEnvironmentName, let token = ProcessInfo.processInfo.environment[tokenEnvironmentName] {
+    request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+  }
+
+  let finished = DispatchSemaphore(value: 0)
+  var response: (status: Int, body: Data)?
+  var transportError: Error?
+  URLSession.shared.dataTask(with: request) { data, urlResponse, error in
+    transportError = error
+    if let http = urlResponse as? HTTPURLResponse {
+      response = (http.statusCode, data ?? Data())
+    }
+    finished.signal()
+  }.resume()
+
+  guard pumpRunLoop(finished, timeout: 15) else {
+    throw FridayError.timeout(stage: "the friday server to answer /stop", seconds: 15)
+  }
+  if let transportError {
+    throw FridayError.serverUnreachable("\(host):\(port) (\(transportError.localizedDescription))")
+  }
+  guard let response else {
+    throw FridayError.serverUnreachable("\(host):\(port) (no response)")
+  }
+  let text = String(decoding: response.body, as: UTF8.self)
+  guard response.status == 200 else {
+    throw FridayError.usage("the server refused the stop (\(response.status)): \(text)")
+  }
+  print(text)
 }
 
 func runConfig(_ arguments: [String], config: FridayConfig) throws {

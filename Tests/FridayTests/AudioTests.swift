@@ -129,6 +129,59 @@ final class AudioServerTests: XCTestCase {
     server = nil
   }
 
+  private func startStream(_ text: String) throws -> RawHTTPClient {
+    let body = try JSONSerialization.data(withJSONObject: [
+      "input": text, "response_format": "pcm", "stream": true,
+    ])
+    let client = try RawHTTPClient(port: server.port, timeout: 30)
+    var head = "POST /v1/audio/speech HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+    head += "Transfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n"
+    try client.write(Data(head.utf8))
+    try client.write(Data(String(body.count, radix: 16).utf8) + Data("\r\n".utf8) + body + Data("\r\n".utf8))
+    try client.write(Data("0\r\n\r\n".utf8))
+    return client
+  }
+
+  private let paragraph = """
+    The first sentence is deliberately long so that synthesis takes a measurable amount \
+    of time. The second sentence continues in the same unhurried manner as the first. \
+    The third sentence keeps the stream alive a little longer still. A fourth sentence \
+    makes sure there is more audio left to cancel when the stop arrives.
+    """
+
+  func testStopEndsAStreamPromptly() throws {
+    let client = try startStream(paragraph)
+    defer { client.close() }
+    Thread.sleep(forTimeInterval: 0.7)
+
+    let started = Date()
+    let stop = try request(method: "POST", path: "/stop", port: server.port, body: Data("{}".utf8))
+    XCTAssertEqual(stop.status, 200, stop.bodyText)
+    XCTAssertTrue(stop.bodyText.contains("\"stopped\":true"), stop.bodyText)
+
+    let response = try client.readToEnd()
+    XCTAssertLessThan(
+      Date().timeIntervalSince(started), 5.0,
+      "a stop should end the stream instead of waiting for the rest of the render"
+    )
+    let head = String(decoding: response.prefix(200), as: UTF8.self)
+    XCTAssertTrue(head.contains("200 OK"), head)
+    XCTAssertGreaterThan(response.count, 400, "some audio was delivered before the stop")
+  }
+
+  func testOtherPathsGetBusyWhileAStreamRuns() throws {
+    let client = try startStream(paragraph)
+    defer { client.close() }
+    Thread.sleep(forTimeInterval: 0.5)
+
+    let busy = try get(path: "/healthz", port: server.port)
+    XCTAssertEqual(busy.status, 503, busy.bodyText)
+    XCTAssertEqual(busy.errorCode(), "busy")
+
+    _ = try? request(method: "POST", path: "/stop", port: server.port, body: Data("{}".utf8))
+    _ = try? client.readToEnd()
+  }
+
   func testSingleLargeChunkIsAccepted() throws {
     // A chunk bigger than the old flat 256 KB read cap, inside the 4 MB body limit.
     var payload = Data(repeating: 0x20, count: 300 * 1024)

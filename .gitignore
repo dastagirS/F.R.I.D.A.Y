@@ -5,5 +5,8 @@
 # Test build products: rebuild with ./test.sh.
 /.build/
 
+# Left behind only if a build is interrupted mid-install.
+/friday.new
+
 # macOS metadata
 .DS_Store

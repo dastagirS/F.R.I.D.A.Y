@@ -168,6 +168,98 @@ final class ServerTests: XCTestCase {
     XCTAssertNotNil(header.headers["x-request-id"], "every response carries a request id")
   }
 
+  func testStopWithNothingInFlightIsHarmless() throws {
+    let server = try ServeHandle()
+    defer { server.stop() }
+    let response = try request(method: "POST", path: "/stop", port: server.port, body: Data("{}".utf8))
+    XCTAssertEqual(response.status, 200)
+    // Nothing has been synthesised yet, so the honest answer is "nothing to stop" rather
+    // than a cheerful success.
+    XCTAssertTrue(response.bodyText.contains("\"stopped\":false"), response.bodyText)
+    XCTAssertTrue(response.bodyText.contains("no request has run yet"), response.bodyText)
+  }
+
+  func testStopTargetsTheRequestThatJustFinished() throws {
+    let server = try ServeHandle()
+    defer { server.stop() }
+    let spoken = try request(
+      method: "POST", path: "/v1/audio/speech", port: server.port,
+      body: Data(#"{"input":"one short sentence","response_format":"pcm"}"#.utf8)
+    )
+    XCTAssertEqual(spoken.status, 200, spoken.bodyText)
+    guard let identifier = spoken.headers["x-request-id"], !identifier.isEmpty else {
+      return XCTFail("no X-Request-Id on the response: \(spoken.headers)")
+    }
+
+    let matched = try request(
+      method: "POST", path: "/stop", port: server.port,
+      body: Data("{\"request_id\":\"\(identifier)\"}".utf8)
+    )
+    XCTAssertEqual(matched.status, 200, matched.bodyText)
+    XCTAssertTrue(matched.bodyText.contains("\"stopped\":true"), matched.bodyText)
+    XCTAssertTrue(matched.bodyText.contains(identifier), matched.bodyText)
+  }
+
+  // The main thread is blocked reading the body here. A stop has to be served from inside
+  // that wait, and it has to mean something: no audio may start afterwards.
+  func testStopIsAnswerableWhileTheBodyIsStillArriving() throws {
+    let server = try ServeHandle()
+    defer { server.stop() }
+    let raw = try RawHTTPClient(port: server.port, timeout: 20)
+    defer { raw.close() }
+    try raw.beginChunkedRequest(
+      path: "/v1/audio/speech",
+      body: Data(#"{"input":"One sentence that has not finished arriving.","response_format":"pcm","stream":true}"#.utf8)
+    )
+
+    let started = Date()
+    let stop = try request(method: "POST", path: "/stop", port: server.port, body: Data("{}".utf8))
+    XCTAssertEqual(stop.status, 200, stop.bodyText)
+    XCTAssertTrue(stop.bodyText.contains("\"stopped\":true"), stop.bodyText)
+    XCTAssertLessThan(
+      Date().timeIntervalSince(started), 5,
+      "the stop waited for the request body instead of being served from the wait loop"
+    )
+
+    let response = try raw.finishChunkedRequest()
+    let text = String(decoding: response, as: UTF8.self)
+    XCTAssertTrue(text.hasPrefix("HTTP/1.1 200"), String(text.prefix(40)))
+    let body = text.components(separatedBy: "\r\n\r\n").dropFirst().joined(separator: "\r\n\r\n")
+    XCTAssertEqual(body, "0\r\n\r\n", "audio was streamed after the request was stopped")
+  }
+
+  func testStopRejectsARequestIdThatIsNotTheLastOne() throws {
+    let server = try ServeHandle()
+    defer { server.stop() }
+    XCTAssertEqual(
+      try request(
+        method: "POST", path: "/v1/audio/speech", port: server.port,
+        body: Data(#"{"input":"one short sentence","response_format":"pcm"}"#.utf8)
+      ).status,
+      200
+    )
+    let refused = try request(
+      method: "POST", path: "/stop", port: server.port,
+      body: Data(#"{"request_id":"deadbeef"}"#.utf8)
+    )
+    XCTAssertEqual(refused.status, 409, refused.bodyText)
+    XCTAssertEqual(refused.errorCode(), "request_mismatch")
+  }
+
+  func testStopCommandReachesTheServer() throws {
+    let server = try ServeHandle()
+    defer { server.stop() }
+    let result = try runFriday(["stop", "--port", String(server.port)])
+    XCTAssertEqual(result.status, 0, result.standardError)
+    XCTAssertTrue(result.standardOutput.contains("stopped"), result.standardOutput)
+  }
+
+  func testStopCommandReportsAnAbsentServer() throws {
+    let result = try runFriday(["stop", "--port", String(unusedPort())])
+    XCTAssertEqual(result.status, 3)
+    XCTAssertTrue(result.standardError.contains("friday serve"), result.standardError)
+  }
+
   func testBearerAuthIsRequiredForEveryRoute() throws {
     let server = try ServeHandle(
       environment: ["FRIDAY_TEST_TOKEN": "sekrit"],

@@ -143,6 +143,7 @@ final class ErrorTaxonomyTests: XCTestCase {
   private let cases: [(FridayError, Int32)] = [
     (.usage("x"), 2),
     (.daemonUnavailable, 3),
+    (.serverUnreachable("127.0.0.1:8787"), 3),
     (.unknownVoice("x", suggestion: nil), 4),
     (.config("x"), 5),
     (.synthesisFailed("x"), 6),

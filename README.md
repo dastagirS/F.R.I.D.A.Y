@@ -49,7 +49,7 @@ friday serve [--port 8787] [--host 127.0.0.1] [--auth-token-env VAR] [--prewarm]
 ```
 POST /v1/audio/speech   {input, voice?, generation?, response_format: wav|pcm, speed?, stream?}
 POST /say               {text, voice?}   speak, then return when playback starts
-POST /stop                               cancel playback and synthesis
+POST /stop                               cancel the request in flight, or leftover playback
 GET  /v1/models                          installed voices
 GET  /healthz                            status, voice count, uptime
 ```
@@ -57,6 +57,16 @@ GET  /healthz                            status, voice count, uptime
 `--auth-token-env VAR` requires `Authorization: Bearer $VAR` on every route. Responses
 carry `X-Request-Id`, `X-Friday-Voice`, `X-Friday-Generation` and `X-Friday-Source`.
 Errors use the OpenAI envelope: `{"error": {"message", "type", "param", "code"}}`.
+
+`/stop` is answered *while* a request runs — the listener is polled inside the wait
+loop that a request spends blocked — so it does not queue behind the answer it is
+cancelling. Every other path gets `503 busy` during that time:
+
+```bash
+friday stop                          # cancel whatever is in flight
+friday stop --request-id 8d67751a    # refuse to cancel anything else (409 otherwise)
+curl -X POST localhost:8787/stop -d '{"request_id":"8d67751a"}'
+```
 
 `serve` keeps one daemon session alive, so requests are warm: 47–72 ms to first audio
 versus roughly 0.5 s for a cold CLI call.
@@ -78,6 +88,8 @@ printf '%s\n' '{"text":"First."}' '{"text":"Second.","end":true}' \
 ```
 
 A streamed response returns first audio in ~60 ms where the buffered form needs ~2 s.
+A stop ends the body cleanly, so the client receives a valid, shorter response rather
+than a truncation it cannot tell from a crash.
 `stream` requires `response_format: "pcm"` — WAV needs a length a stream cannot know.
 NDJSON accepts `text`, `flush`, `voice`, `end`.
 
@@ -122,7 +134,7 @@ Exit codes name the failure class:
 | 0 | success |
 | 1 | unexpected (re-run with `--debug`) |
 | 2 | bad usage or invalid value |
-| 3 | sirittsd unreachable |
+| 3 | service unreachable (sirittsd, or `friday serve` for `stop`) |
 | 4 | unknown voice (suggests the nearest installed name) |
 | 5 | config unreadable or unparsable |
 | 6 | synthesis failed |
@@ -157,12 +169,14 @@ Xcode, only testing does. There is no CI: the audio checks need this machine.
 
 - Private Apple framework (`SiriTTSService`). An OS update can break it; not App
   Store shippable.
-- `/stop` cannot preempt a stream in flight — the server is single-threaded. Ctrl-C
-  on the CLI can.
+- Requests serialise: one connection at a time, and while one runs any other path is
+  `503 busy`. Only `/stop` is answered, and only from inside the wait a request already
+  spends blocked — so a stop is noticed at the next 20 ms slice, not instantly.
 - `nora` clips on the standard path (1.17% of samples at full scale). `simone` and
   `Riya` are clean.
 - `voices --install` and `--purge --force` have not been exercised against a real
   bundle.
+- A request body that stops arriving is dropped after 300 s of silence.
 - Uses `AVAudioEngine.connect` / `AVAudioPlayerNode.play`, deprecated in macOS 27.
 - macOS 27 minimum.
 

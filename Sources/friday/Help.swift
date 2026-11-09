@@ -25,6 +25,7 @@ USAGE
   friday [options] TEXT | -
   friday [options] --list
   friday serve    [--port 8787] [--host 127.0.0.1] [--auth-token-env VAR]
+  friday stop     [--port 8787] [--request-id ID]      cancel the request in flight
   friday voices   [--status NAME | --install NAME --language xx | --manage | --default NAME]
   friday config   [set KEY VALUE [--standard|--expressive] | unset KEY | reset]
 
@@ -101,7 +102,7 @@ let completionScripts: [String: String] = [
 #compdef friday
 _friday() {
   local -a subcommands voices
-  subcommands=(serve voices config)
+  subcommands=(serve stop voices config)
   if (( CURRENT == 2 )); then
     _describe 'subcommand' subcommands
   fi
@@ -142,7 +143,7 @@ _friday() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  subcommands="serve voices config"
+  subcommands="serve stop voices config"
   case "$prev" in
     -v|--voice) COMPREPLY=( $(compgen -W "simone nora damon aaron quinn martha arthur Riya" -- "$cur") ); return ;;
     --language) COMPREPLY=( $(compgen -W "en-US en-IN en-GB" -- "$cur") ); return ;;
@@ -157,7 +158,7 @@ _friday() {
 complete -F _friday friday
 """,
   "fish": """
-complete -c friday -n '__fish_use_subcommand' -a 'serve voices config'
+complete -c friday -n '__fish_use_subcommand' -a 'serve stop voices config'
 complete -c friday -s v -l voice -d 'voice name' -a 'simone nora damon aaron quinn martha arthur Riya'
 complete -c friday -l language -d 'language tag' -a 'en-US en-IN en-GB'
 complete -c friday -l generation -d 'render path' -a 'standard expressive'
@@ -193,6 +194,9 @@ friday \\- speak text with Siri's voices, locally
 .br
 .B friday serve
 [\\fB\\-\\-port\\fR N] [\\fB\\-\\-host\\fR H] [\\fB\\-\\-auth-token-env\\fR VAR]
+.br
+.B friday stop
+[\\fB\\-\\-port\\fR N] [\\fB\\-\\-request-id\\fR ID]
 .br
 .B friday voices
 [\\fB\\-\\-status\\fR NAME | \\fB\\-\\-install\\fR NAME \\fB\\-\\-language\\fR xx | \\fB\\-\\-manage\\fR | \\fB\\-\\-default\\fR NAME]
@@ -282,10 +286,12 @@ Unexpected failure. Re-run with
 for the stage that failed.
 .TP
 .B 2
-Bad usage: unknown flag or subcommand, or an invalid flag value.
+Bad usage: unknown flag or subcommand, an invalid flag value, or a request the
+server rejected outright (a stop for a request that is not the active one).
 .TP
 .B 3
-sirittsd is unreachable.
+The service is unreachable: sirittsd for speech, or the server itself for
+\\fBfriday stop\\fR.
 .TP
 .B 4
 No installed voice matched the requested name.
@@ -318,6 +324,12 @@ listens on 127.0.0.1:8787 by default and exposes
 .BR GET " /v1/models" ,
 .BR GET " /healthz" .
 Pass \\fB\\-\\-auth-token-env VAR\\fR to require a bearer token from environment VAR.
+.PP
+\\fBPOST /stop\\fR cancels the request in flight, or playback left over from the
+last one. It is answered from inside the wait a request spends blocked, so it does not
+queue behind the answer it is cancelling; other paths get 503 while a request runs. Pass
+a JSON body
+with \\fBrequest_id\\fR to refuse cancelling anything else, or run \\fBfriday stop\\fR.
 .SH CAVEATS
 Uses a private Apple framework. Undocumented, unentitled, and an OS update can
 break it. Not shippable to the App Store.
@@ -485,15 +497,17 @@ friday serve --port 8787 [--host 127.0.0.1] [--auth-token-env FRIDAY_TOKEN] [--p
 - `GET /v1/models` installed voices in OpenAI list shape
 - `POST /v1/audio/speech` OpenAI-compatible: `input` (or `text`), `voice`, `response_format` (`wav`|`pcm`), `rate`
 - `POST /say` speak, returning after playback finishes
-- `POST /stop` barge-in: cancel and drop queued audio
+- `POST /stop` barge-in: cancels the request in flight, or playback from the last one.
+  Answered while a request runs (the listener is polled in the wait loop), so it does not
+  queue behind the answer it cancels; other paths get 503 during that time.
+  `friday stop [--port N] [--request-id ID]` does the same from a shell.
 
 Bearer auth is enabled by naming an environment variable with `--auth-token-env`.
 Binding a non-loopback host without a token warns: this exposes the microphone-free
 speaker to the network.
 
-Limits worth knowing before building on it: the server runs synthesis on a single main
-run loop, so `/stop` cannot preempt an in-flight synthesis, requests serialise, and
-there is no TLS, CORS, or keep-alive. A dropped `AudioStreamBasicDescription` on a
+Limits worth knowing before building on it: requests serialise (one accept loop), so a
+long synthesis delays the next connection, and there is no TLS, CORS, or keep-alive. A dropped `AudioStreamBasicDescription` on a
 terminator chunk used to corrupt WAV output; decoding now normalises every chunk.
 
 ## Voices

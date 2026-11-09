@@ -12,8 +12,27 @@ hand-written one containing only what this tool needs.
 - `_clientId = "com.apple.siritts-tool"` is required for the expressive voices, together
   with `voicePacePreset` / `voiceExpressivityPreset` set by KVC on the request context.
   Without them the daemon silently substitutes a generic legacy render.
-- Everything runs on the main thread because the daemon delivers its callbacks through
-  the run loop; the HTTP server is single-threaded for the same reason.
+- Daemon callbacks do **not** arrive on the main thread: `didGenerateAudio`,
+  `didGenerateWordTimings` and the synthesis completion all run on sirittsd's own
+  threads (`Thread.isMainThread` is false, measured). They signal a semaphore; the main
+  thread pumps its run loop while waiting, which is what lets the SIGINT dispatch source
+  and timers fire. Request handling is serial because the accept loop handles one
+  connection at a time, not because of thread affinity.
+- A stop has to be answered while a request runs, and the main thread is busy waiting.
+  It polls the listener with `poll(…, 0)` on each 20 ms slice of that wait (`pumpRunLoop`
+  takes a `tick`), so `/stop` is served at most one slice late, on the same thread, and
+  anything else gets 503. An earlier design used a second accepting thread with an
+  "in flight" flag; a client that sent its next request immediately after reading a
+  response could be refused while that flag was still set, so it was replaced. The audio
+  callback still writes chunks from the daemon's thread, which is why nothing else touches
+  that socket during a stream.
+- A stop has to be answerable whenever the main thread is blocked, which is in two places:
+  waiting for a synthesis, and waiting for the next chunk of a request body. Both poll the
+  listener. The body reader switches to 200 ms receive slices while a tick is attached and
+  gives up after 300 s of silence, so a stalled producer cannot pin the server.
+- The cancel flag is cleared once per request, not per synthesis, and checked before each
+  utterance is submitted. Clearing it inside `synthesize()` lost stops that arrived while
+  the body was still arriving — the server answered `stopped: true` and then spoke anyway.
 
 ## Encodings
 

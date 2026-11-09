@@ -33,6 +33,15 @@ final class Synthesizer {
     self.catalog = catalog
   }
 
+  // Called once per request, before any synthesis for it: clearing the flag inside
+  // synthesize() instead would lose a stop that arrives while the request is still
+  // reading its body, and the request would then speak after being told it was stopped.
+  func beginRequest() {
+    stateLock.lock()
+    cancelled = false
+    stateLock.unlock()
+  }
+
   // Barge-in: cancel the daemon request, drop queued audio, unblock the waiter.
   func cancelActive() {
     stateLock.lock()
@@ -104,6 +113,7 @@ final class Synthesizer {
     playback: Bool,
     chunkSentences: Bool,
     lossless: Bool,
+    whileWaiting: (() -> Void)? = nil,
     onAudio: ((AVAudioPCMBuffer) -> Void)? = nil
   ) throws -> SynthesisOutcome {
     workLock.lock()
@@ -142,11 +152,17 @@ final class Synthesizer {
     var wasCancelled = false
 
     stateLock.lock()
-    cancelled = false
     lastSpeaker = speaker
     stateLock.unlock()
 
     for (index, utterance) in utterances.enumerated() {
+      // Checked before each request, not only after: a stop that arrived while this
+      // synthesis was being set up must not produce any audio at all.
+      stateLock.lock()
+      let cancelledBeforeRequest = cancelled
+      stateLock.unlock()
+      if cancelledBeforeRequest { wasCancelled = true; break }
+
       // The daemon answers lossless PCM for the first synthesis after its compiled
       // cache is dropped, then falls back to ~50 kbps Opus. Clearing per request keeps
       // every sentence on the lossless encoder; measured cost is ~0.45 s of synthesis
@@ -221,7 +237,7 @@ final class Synthesizer {
         synthesisError = error
         finish.signal()
       }
-      let completed = pumpRunLoop(finish, timeout: 120)
+      let completed = pumpRunLoop(finish, timeout: 120, tick: whileWaiting)
 
       stateLock.lock()
       let cancelledNow = cancelled
@@ -258,7 +274,7 @@ final class Synthesizer {
     let firstAudioMilliseconds = firstAudioAt.map { $0.timeIntervalSince(start) * 1000 } ?? -1
     if let speaker {
       speaker.finish()
-      let drained = pumpRunLoop(speaker.drained, timeout: 900)
+      let drained = pumpRunLoop(speaker.drained, timeout: 900, tick: whileWaiting)
       if let failure = speaker.startupFailure {
         throw FridayError.audioOutput("cannot play audio: \(failure.localizedDescription)")
       }
