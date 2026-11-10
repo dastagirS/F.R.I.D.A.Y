@@ -147,6 +147,8 @@ final class Synthesizer {
 
     let start = Date()
     var firstAudioAt: Date?
+    // Set by the audio callback when the daemon answers with its legacy render.
+    var substitutedRate: Double?
     var streamedFrames = 0
     var audioSecondsBefore = 0.0
     var wasCancelled = false
@@ -179,10 +181,20 @@ final class Synthesizer {
 
       var chunkFrames = 0
       var undecodable = 0
+      let finish = DispatchSemaphore(value: 0)
       request.synthesisContext.didGenerateAudio = { chunk in
         // The daemon ends every request with an empty chunk carrying a zeroed
         // description. That is not a failure; counting it would warn on every render.
         guard !chunk.audioData.isEmpty else { return }
+        // Wrong audio is worse than none: a substituted voice is stopped before a single
+        // sample reaches the speaker or the stream.
+        if substitutedRate == nil,
+           isLegacySubstitution(deliveredRate: chunk.asbd.mSampleRate, assetKey: voice.assetKey) {
+          substitutedRate = chunk.asbd.mSampleRate
+          session.cancel(request: request)
+          finish.signal()
+          return
+        }
         guard let buffer = decoder.decode(chunk) else {
           undecodable += 1
           Debug.stage("decode", "chunk failed: \(chunk.audioData.count) bytes, asbd=\(fourCharacterCode(chunk.asbd.mFormatID)) \(Int(chunk.asbd.mSampleRate))Hz")
@@ -224,7 +236,6 @@ final class Synthesizer {
         }
       }
 
-      let finish = DispatchSemaphore(value: 0)
       stateLock.lock()
       activeSession = session
       activeRequest = request
@@ -249,6 +260,14 @@ final class Synthesizer {
 
       // A barge-in stops the whole utterance, not just the sentence in flight.
       if cancelledNow { wasCancelled = true; break }
+      if let substitutedRate {
+        speaker?.stop()
+        throw FridayError.voiceSubstituted(
+          voice: voice.name ?? voice.assetKey,
+          deliveredRate: substitutedRate,
+          hint: "friday voices --install \(voice.name ?? voice.assetKey) --language \(voice.language) --wait"
+        )
+      }
       guard completed else {
         throw FridayError.timeout(
           stage: "synthesis of request \(index + 1) of \(utterances.count) (\(utterance.text.count) characters)",

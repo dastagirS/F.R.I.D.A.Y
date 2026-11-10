@@ -182,9 +182,12 @@ final class ServerTests: XCTestCase {
   func testStopTargetsTheRequestThatJustFinished() throws {
     let server = try ServeHandle()
     defer { server.stop() }
+    guard let voice = try firstRenderableVoice(port: server.port) else {
+      throw XCTSkip("this machine cannot render any installed voice (missing voice assets)")
+    }
     let spoken = try request(
       method: "POST", path: "/v1/audio/speech", port: server.port,
-      body: Data(#"{"input":"one short sentence","response_format":"pcm"}"#.utf8)
+      body: Data(#"{"input":"one short sentence","response_format":"pcm","voice":"\#(voice)"}"#.utf8)
     )
     XCTAssertEqual(spoken.status, 200, spoken.bodyText)
     guard let identifier = spoken.headers["x-request-id"], !identifier.isEmpty else {
@@ -231,10 +234,13 @@ final class ServerTests: XCTestCase {
   func testStopRejectsARequestIdThatIsNotTheLastOne() throws {
     let server = try ServeHandle()
     defer { server.stop() }
+    guard let voice = try firstRenderableVoice(port: server.port) else {
+      throw XCTSkip("this machine cannot render any installed voice (missing voice assets)")
+    }
     XCTAssertEqual(
       try request(
         method: "POST", path: "/v1/audio/speech", port: server.port,
-        body: Data(#"{"input":"one short sentence","response_format":"pcm"}"#.utf8)
+        body: Data(#"{"input":"one short sentence","response_format":"pcm","voice":"\#(voice)"}"#.utf8)
       ).status,
       200
     )

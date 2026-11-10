@@ -46,6 +46,70 @@ func runServe(_ arguments: [String], config: FridayConfig) throws -> Never {
   try server.run()
 }
 
+// The daemon's inventory and Apple's asset store disagree in both directions, so the only
+// useful status prints both. A voice can be "installed" for the daemon while the asset the
+// standard path needs is still only downloadable — and that is the state that renders an
+// entirely different, legacy voice with no error at all.
+func reportAssetTruth(for voice: SynthesisVoice) {
+  let records = catalogRecords(for: voice, in: (try? listCatalogAssets()) ?? [])
+  guard !records.isEmpty else {
+    print("assets\tnone\tthe asset catalog has no record for this voice")
+    return
+  }
+  let installed = localAssetSpecifiers()
+  var naturalInstalled = false
+  for record in records.sorted(by: { $0.technology < $1.technology }) {
+    let present = installed[record.specifier] != nil || record.locallyAvailable
+    // The family is the technology field; quality is "premium" for all of these.
+    if present, record.technology.lowercased() == "natural" { naturalInstalled = true }
+    print("assets\t\(present ? "installed" : "available")\t\(record.technology)/\(record.quality)\t\(record.specifier)")
+  }
+  if naturalInstalled {
+    print("render\tsiri-path\tnatural asset installed; measured 48 kHz")
+  } else {
+    print("render\tlegacy-fallback\tmeasured 22050 Hz: the daemon substitutes a different voice")
+    print("repair\tfriday voices --install \(voice.name ?? voice.assetKey) --language \(voice.language) --wait")
+    print("repair\tSystem Settings > Accessibility > Spoken Content > Manage Voices (same asset)")
+  }
+}
+
+func catalogRecords(for voice: SynthesisVoice, in assets: [TTSAssetInfo]) -> [TTSAssetInfo] {
+  let locale = voice.language.replacingOccurrences(of: "-", with: "_").lowercased()
+  guard let name = voice.name?.lowercased(), !name.isEmpty else { return [] }
+  return assets.filter { $0.language.lowercased() == locale && $0.name.lowercased() == name }
+}
+
+// The asset worth downloading: present in the catalog, not installed, and from the family
+// the standard path renders. Measured ordering: natural arrives at 48 kHz, neural at 24 kHz
+// only behind the expressive client identity, so natural is preferred.
+func installableAsset(for target: String, in assets: [TTSAssetInfo], installed: [String: String]) -> String? {
+  let matches: [TTSAssetInfo]
+  if target.hasPrefix("com.apple.siri.tts.voice.") {
+    matches = assets.filter { $0.specifier == target }
+  } else {
+    let lowered = target.lowercased()
+    matches = assets.filter { $0.name.lowercased() == lowered }
+  }
+  func rank(_ technology: String) -> Int {
+    switch technology.lowercased() {
+    case "natural": return 2
+    case "neural": return 1
+    default: return 0
+    }
+  }
+  // Only an improvement counts. Riya has its natural asset installed and a neural one on
+  // offer; prompting a 66 MB download for an asset the standard path renders worse would
+  // be a regression dressed up as a repair.
+  let installedBest = matches
+    .filter { installed[$0.specifier] != nil || $0.locallyAvailable }
+    .map { rank($0.technology) }
+    .max() ?? -1
+  return matches
+    .filter { installed[$0.specifier] == nil && !$0.locallyAvailable && rank($0.technology) > installedBest }
+    .max { rank($0.technology) < rank($1.technology) }?
+    .specifier
+}
+
 func runVoices(_ arguments: [String], config: FridayConfig) throws {
   var action = "list"
   var target: String?
@@ -113,6 +177,7 @@ func runVoices(_ arguments: [String], config: FridayConfig) throws {
                                     voiceWasExplicit: !isDefaultSelection,
                                     usingBuiltInDefault: isDefaultSelection && config.defaultVoice == nil)
     print("installed\t\(match.language)\t\(match.name ?? "-")\tasset=\(VoiceCatalog.generation(match))\tdefault-render=\(render)\t\(match.assetKey)")
+    reportAssetTruth(for: match)
 
   case "available":
     let assets = try listCatalogAssets()
@@ -161,14 +226,28 @@ func runVoices(_ arguments: [String], config: FridayConfig) throws {
 
   case "install":
     guard let target else { throw FridayError.usage("--install needs a voice name") }
-    if let existing = catalog.find(name: target) {
+    // A daemon record is not proof the voice renders: the asset the daemon needs can
+    // still be available-only, which is exactly the state that produces the legacy
+    // fallback. So an installable asset outweighs an existing record.
+    let catalogued = (try? listCatalogAssets()) ?? []
+    let installedSpecifiers = localAssetSpecifiers()
+    let upgrade = installableAsset(for: target, in: catalogued, installed: installedSpecifiers)
+    if let existing = catalog.find(name: target), upgrade == nil {
       print("already-installed\t\(existing.language)\t\(existing.name ?? "-")\t\(existing.assetKey)")
       return
     }
-    guard let language else {
+    // "com.apple.siri.tts.voice.en_US.simone.natural.premium" -> "en_US"
+    let resolvedLanguage = language ?? upgrade?
+      .components(separatedBy: "voice.").last?
+      .split(separator: ".").first.map(String.init)
+    guard let resolvedLanguage else {
       throw FridayError.usage("--install needs --language for a voice that is not installed yet, e.g. --language en-GB")
     }
-    let voice = SynthesisVoice(language: language, name: target)
+    // Poll the asset store for the specifier when one is known: the daemon's voice list
+    // only changes after the asset lands, so waiting on names alone can never report
+    // progress and always ends in a timeout.
+    let awaitedSpecifier = upgrade ?? (target.hasPrefix("com.apple.siri.tts.voice.") ? target : nil)
+    let voice = SynthesisVoice(language: resolvedLanguage, name: awaitedSpecifier ?? target)
     let subscribeDone = DispatchSemaphore(value: 0)
     var subscribeError: Error?
     catalog.session.subscribe(voices: [voice]) { error in
@@ -179,19 +258,33 @@ func runVoices(_ arguments: [String], config: FridayConfig) throws {
       throw FridayError.timeout(stage: "a voice download request", seconds: 30)
     }
     if let subscribeError { throw FridayError.synthesisFailed("\(subscribeError)") }
-    print("requested\t\(language)\t\(target)\t(download is asynchronous)")
+    // The daemon accepts the request whether or not a transfer starts, so this says what
+    // was asked for and nothing about progress. The asset store is the only witness.
+    print("requested\t\(resolvedLanguage)\t\(target)\t(the daemon gives no progress; --wait polls the asset store)")
+    if let awaitedSpecifier, localAssetSpecifiers()[awaitedSpecifier] != nil {
+      print("installed\t\(awaitedSpecifier)")
+      return
+    }
     guard waitForInstall else { return }
     let deadline = Date().addingTimeInterval(timeoutSeconds)
     while Date() < deadline {
-      if catalog.refresh().contains(where: { ($0.name ?? "") == target }) {
-        print("installed\t\(language)\t\(target)")
+      if let awaitedSpecifier, localAssetSpecifiers()[awaitedSpecifier] != nil {
+        print("installed\t\(awaitedSpecifier)")
+        return
+      }
+      if awaitedSpecifier == nil, catalog.refresh().contains(where: { ($0.name ?? "") == target }) {
+        print("installed\t\(resolvedLanguage)\t\(target)")
         return
       }
       Thread.sleep(forTimeInterval: 2)
     }
-    throw FridayError.timeout(
-      stage: "'\(target)' to finish downloading", seconds: timeoutSeconds
-    )
+    if let awaitedSpecifier {
+      throw FridayError.timeout(
+        stage: "'\(awaitedSpecifier)' to finish downloading (asset store still has it as \(localAssetSpecifiers()[awaitedSpecifier] == nil ? "not installed" : "installed"))",
+        seconds: timeoutSeconds
+      )
+    }
+    throw FridayError.timeout(stage: "'\(target)' to finish downloading", seconds: timeoutSeconds)
 
   case "manage":
     let url = "x-apple.systempreferences:com.apple.preference.universalaccess?SpokenContent"

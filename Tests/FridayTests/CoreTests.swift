@@ -145,6 +145,7 @@ final class ErrorTaxonomyTests: XCTestCase {
     (.daemonUnavailable, 3),
     (.serverUnreachable("127.0.0.1:8787"), 3),
     (.unknownVoice("x", suggestion: nil), 4),
+    (.voiceSubstituted(voice: "simone", deliveredRate: 22_050, hint: "install it"), 10),
     (.config("x"), 5),
     (.synthesisFailed("x"), 6),
     (.timeout(stage: "x", seconds: 1), 7),
@@ -159,7 +160,19 @@ final class ErrorTaxonomyTests: XCTestCase {
       XCTAssertEqual(error.exitCode, expected, "\(error) should exit \(expected)")
       XCTAssertFalse(error.description.isEmpty, "\(error) needs a message")
     }
-    XCTAssertEqual(Set(cases.map { $0.0.exitCode }), Set<Int32>([2, 3, 4, 5, 6, 7, 8, 9, 130]))
+    XCTAssertEqual(Set(cases.map { $0.0.exitCode }), Set<Int32>([2, 3, 4, 5, 6, 7, 8, 9, 10, 130]))
+  }
+
+  // The tell is the rate: premium Siri voices arrive at 48 kHz (natural asset) or
+  // 24 kHz (neural asset); 22.05 kHz is the legacy render the daemon substitutes.
+  func testLegacySubstitutionIsDetectedByRate() {
+    // The tell is the rate: premium Siri voices arrive at 48 kHz (natural asset) or
+    // 24 kHz (neural); 22.05 kHz is the legacy render the daemon substitutes silently.
+    XCTAssertTrue(isLegacySubstitution(deliveredRate: 22_050, assetKey: "en-US:fmvoice:female:simone:premium:0"))
+    XCTAssertFalse(isLegacySubstitution(deliveredRate: 48_000, assetKey: "en-IN:natural:female:Riya:premium:5049"))
+    XCTAssertFalse(isLegacySubstitution(deliveredRate: 24_000, assetKey: "en-US:fmvoice:female:simone:premium:0"))
+    // A genuinely legacy MacinTalk voice can be 22.05 kHz and is not a substitution.
+    XCTAssertFalse(isLegacySubstitution(deliveredRate: 22_050, assetKey: "en-US:Samantha"))
   }
 
   func testUnknownVoiceNamesTheNearMiss() {

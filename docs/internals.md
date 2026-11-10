@@ -33,6 +33,27 @@ hand-written one containing only what this tool needs.
 - The cancel flag is cleared once per request, not per synthesis, and checked before each
   utterance is submitted. Clearing it inside `synthesize()` lost stops that arrived while
   the body was still arriving — the server answered `stopped: true` and then spoke anyway.
+- A missing voice asset does not fail; the daemon substitutes its legacy Vocalizer render
+  and returns success, so the only evidence is the delivered rate. Measured on macOS 27.2:
+  premium Siri voices arrive at 48 kHz behind an installed `natural` asset, at 24 kHz
+  behind `neural`, and at 22.05 kHz when the asset the daemon wants is absent — at which
+  point every en-US name returns byte-identical audio (`md5 edf6ab13…` for simone, nora,
+  aaron, quinn, damon, en-US-F, en-US-G). friday checks the rate on the first chunk and
+  stops before a sample reaches the speaker or the stream (`isLegacySubstitution`). The
+  tell survives `--fast` and a warm daemon because the fallback is delivered as
+  22.05 kHz lpcm in every observed case; a fallback delivered as opus (always 48 kHz)
+  would evade the rate check, which is the residual hole in this detection.
+- Rejected fix, with evidence: giving the standard path the expressive client identity
+  (`_clientId = "com.apple.siritts-tool"`) does *not* restore the 48 kHz voice. It routes
+  en-US voices to the neural model instead (24 kHz, same 73,440 frames as the expressive
+  render of the same text) — which is the family the user rejected by ear — and makes every
+  en-GB voice fail with `FrontendOverrideAction: Cannot find resource asset`. The identity
+  stays where it belongs: the expressive path.
+- `subscribe(voices:)` returns without error whether or not a transfer starts, so
+  `voices --install` cannot report progress and does not claim any; the asset store is the
+  only witness, and `--wait` polls it by specifier. Before that, `--wait` polled the
+  daemon's voice list, which only changes after the asset lands, so it could never observe
+  progress and always ended in a timeout.
 
 ## Encodings
 

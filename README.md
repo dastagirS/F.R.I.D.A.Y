@@ -141,6 +141,7 @@ Exit codes name the failure class:
 | 7 | timeout |
 | 8 | no audio produced |
 | 9 | output failed |
+| 10 | the daemon substituted a different voice (its asset is missing) |
 | 130 | cancelled |
 
 An unparsable flag is an error, not text to speak. Bad values are refused rather than
@@ -176,6 +177,11 @@ Xcode, only testing does. There is no CI: the audio checks need this machine.
   `Riya` are clean.
 - `voices --install` and `--purge --force` have not been exercised against a real
   bundle.
+- Premium Siri voices need the asset the daemon actually renders from. When it is
+  missing the daemon substitutes its legacy voice and reports success, so friday checks
+  the delivered rate and fails with exit 10 instead of speaking the wrong voice.
+  `friday voices --status <voice>` shows which asset is `available` rather than
+  `installed`.
 - A request body that stops arriving is dropped after 300 s of silence.
 - Uses `AVAudioEngine.connect` / `AVAudioPlayerNode.play`, deprecated in macOS 27.
 - macOS 27 minimum.

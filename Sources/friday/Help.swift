@@ -313,6 +313,11 @@ Synthesis produced no audio.
 Output failed: cannot write the file, the audio engine refused to start, or a system
 helper such as opening System Settings failed.
 .TP
+.B 10
+The daemon rendered a different voice than the one asked for: the asset it needs is
+not installed. The message names the voice, the rate that gave it away, and the
+repair; no audio is written and nothing is played.
+.TP
 .B 130
 Cancelled with Ctrl-C, which is a barge-in rather than an error.
 .SH SERVER
@@ -397,6 +402,14 @@ friday config set expressivity 3
 
 Voice and render path are separate settings: an asset can be reachable through both.
 `--standard` forces the standard path even on an expressive asset.
+
+A voice can be listed as installed while the asset the daemon renders from is not. Then
+the daemon silently speaks a different, legacy voice and reports success, so friday checks
+the delivered rate and exits 10 with the voice, the rate, and the repair instead of handing
+back the wrong voice. `friday voices --status <voice>` prints the asset truth for it; fix
+it with `friday voices --install <voice> --language <lang> --wait` or from System Settings
+> Accessibility > Spoken Content > Manage Voices. Never paper over exit 10 by switching to
+`say`.
 
 ## Rendering paths
 

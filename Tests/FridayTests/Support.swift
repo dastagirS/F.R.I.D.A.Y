@@ -297,6 +297,24 @@ func chunkTexts(_ text: String) -> [String] {
 
 /// A minimal TCP client for the tests that need to control chunk framing themselves:
 /// URLSession decides its own chunk sizes, which cannot exercise a single large chunk.
+// Tests that need something in flight must not depend on the machine's default voice:
+// a missing voice asset makes the daemon substitute a different voice, and friday now
+// refuses that (exit 10 / voice_substituted). Walks the server's own model list and
+// returns the first voice it will actually render, or nil when none will.
+func firstRenderableVoice(port: Int, limit: Int = 20) throws -> String? {
+  let models = try get(path: "/v1/models", port: port)
+  guard models.status == 200,
+        let payload = try? JSONSerialization.jsonObject(with: models.body) as? [String: Any],
+        let list = payload["data"] as? [[String: Any]] else { return nil }
+  let identifiers = list.compactMap { $0["id"] as? String }.prefix(limit)
+  for identifier in identifiers {
+    let body = Data(#"{"input":"ok","response_format":"pcm","voice":"\#(identifier)"}"#.utf8)
+    let response = try request(method: "POST", path: "/v1/audio/speech", port: port, body: body)
+    if response.status == 200 { return identifier }
+  }
+  return nil
+}
+
 final class RawHTTPClient {
   private var descriptor: Int32 = -1
 

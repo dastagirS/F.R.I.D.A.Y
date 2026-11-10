@@ -46,10 +46,23 @@ func isPlausibleFormat(_ asbd: AudioStreamBasicDescription) -> Bool {
 // shell convention for SIGINT; 1 stays reserved for a failure we did not anticipate.
 // The command-line guidelines ask for non-zero codes mapped to the important failure
 // modes rather than one generic error, which is what this does.
+// The daemon answers with its legacy Vocalizer render when the asset a premium voice
+// needs is missing, and reports success. Measured on this machine: premium Siri voices
+// arrive at 48 kHz (natural asset) or 24 kHz (neural asset), while the fallback is
+// 22.05 kHz and is byte-identical for every en-US name asked for. The rate is the cheap
+// tell, and checking it is the only way to notice, because the request succeeds.
+let legacyFallbackSampleRate: Double = 22_050
+
+func isLegacySubstitution(deliveredRate: Double, assetKey: String) -> Bool {
+  guard assetKey.lowercased().contains("premium") else { return false }
+  return abs(deliveredRate - legacyFallbackSampleRate) < 1
+}
+
 enum FridayError: Error, CustomStringConvertible {
   case daemonUnavailable
   case serverUnreachable(String)
   case unknownVoice(String, suggestion: String?)
+  case voiceSubstituted(voice: String, deliveredRate: Double, hint: String)
   case synthesisFailed(String)
   case timeout(stage: String, seconds: Double)
   case nothingCaptured(chunks: Int, formats: String)
@@ -68,6 +81,8 @@ enum FridayError: Error, CustomStringConvertible {
     case .unknownVoice(let name, let suggestion):
       let hint = suggestion.map { "; did you mean '\($0)'?" } ?? ""
       return "no installed voice matches '\(name)'\(hint); run 'friday voices' for the list"
+    case .voiceSubstituted(let voice, let rate, let hint):
+      return "the daemon rendered a different voice: '\(voice)' returned \(Int(rate)) Hz, its legacy fallback rather than the voice asked for; the asset it needs is not installed. Run 'friday voices --status \(voice)' to see which, then \(hint) (or install it from System Settings > Accessibility > Spoken Content > Manage Voices)"
     case .synthesisFailed(let reason): return "synthesis failed: \(reason)"
     case .timeout(let stage, let seconds):
       return "timed out after \(Int(seconds))s waiting for \(stage)"
@@ -87,6 +102,7 @@ enum FridayError: Error, CustomStringConvertible {
     case .usage: return 2
     case .daemonUnavailable, .serverUnreachable: return 3
     case .unknownVoice: return 4
+    case .voiceSubstituted: return 10
     case .config: return 5
     case .synthesisFailed: return 6
     case .timeout: return 7

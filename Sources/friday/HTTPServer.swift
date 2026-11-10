@@ -588,6 +588,13 @@ final class HTTPServer {
       status = 500
       type = "server_error"
       code = "audio_output_failed"
+    case FridayError.voiceSubstituted(_, _, _):
+      // The request was well formed and the daemon said yes; the machine cannot render
+      // this voice. Distinguishable from a bad request so a client can offer advice.
+      status = 500
+      type = "server_error"
+      param = "voice"
+      code = "voice_substituted"
     case FridayError.cancelled:
       status = 409
       type = "invalid_request_error"
