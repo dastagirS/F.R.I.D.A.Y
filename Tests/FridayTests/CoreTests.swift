@@ -175,6 +175,31 @@ final class ErrorTaxonomyTests: XCTestCase {
     XCTAssertFalse(isLegacySubstitution(deliveredRate: 22_050, assetKey: "en-US:Samantha"))
   }
 
+  // The daemon matches a subscription on the assetKey it computes for the voice it is
+  // handed, so the identity has to be rebuilt exactly: hyphenated locale, gender word,
+  // and the asset's own version. Measured against the installed en-IN Riya asset, whose
+  // daemon key is "en-IN:natural:female:Riya:premium:5049".
+  func testAssetIdentityMatchesTheDaemonsOwnKeyFormat() {
+    let asset = TTSAssetInfo(
+      identifier: "com.apple.speech.synthesis.voice.custom.siri.riya.premium",
+      name: "Riya", language: "en_IN", technology: "natural", quality: "premium",
+      gender: 2, version: 5049, downloadBytes: 0, diskBytes: 0, locallyAvailable: true
+    )
+    XCTAssertEqual(asset.voiceLanguage, "en-IN")
+    XCTAssertEqual(asset.nativeAssetKey, "en-IN:natural:female:Riya:premium:5049")
+    // The MobileAsset specifier keeps the underscore form; mixing the two matches nothing.
+    XCTAssertEqual(asset.specifier, "com.apple.siri.tts.voice.en_IN.riya.natural.premium")
+  }
+
+  func testVoiceTypeMappingCoversTheCatalogFamilies() {
+    XCTAssertEqual(voiceType(forTechnology: "natural"), 6)
+    XCTAssertEqual(voiceType(forTechnology: "neural"), 4)
+    XCTAssertEqual(voiceType(forTechnology: "neuralAX"), 5)
+    XCTAssertEqual(voiceType(forTechnology: "gryphon"), 3)
+    // "fmvoice" is the expressive identity; it has no downloadable individual bundle.
+    XCTAssertNil(voiceType(forTechnology: "fmvoice"))
+  }
+
   func testUnknownVoiceNamesTheNearMiss() {
     let hinted = FridayError.unknownVoice("Riaya", suggestion: "Riya").description
     XCTAssertTrue(hinted.contains("did you mean 'Riya'?"))

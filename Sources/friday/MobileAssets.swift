@@ -1,5 +1,6 @@
 import Foundation
 import ObjectiveC.runtime
+import SiriTTSService
 
 // The downloadable voice catalog lives behind private TTS asset classes with no
 // headers, and several of its getters return scalars. Sending `perform` to a
@@ -13,6 +14,8 @@ struct TTSAssetInfo {
   let language: String
   let technology: String
   let quality: String
+  let gender: Int
+  let version: Int
   let downloadBytes: Int
   let diskBytes: Int
   var locallyAvailable: Bool
@@ -21,6 +24,56 @@ struct TTSAssetInfo {
   var specifier: String {
     "com.apple.siri.tts.voice.\(language).\(name.lowercased()).\(technology).\(quality)"
   }
+
+  // Locale spelling used inside an asset identity. Apple's own keys are hyphenated
+  // ("en-IN:natural:female:Riya:premium:5049"); the MobileAsset specifier uses the
+  // underscore form ("…voice.en_IN.riya.natural.premium"). Mixing them matches nothing.
+  var voiceLanguage: String {
+    language.replacingOccurrences(of: "_", with: "-")
+  }
+
+  // The identity `SynthesisVoice.assetKey` produces once type, gender, footprint and
+  // version are set — the value the daemon matches a subscription against.
+  var nativeAssetKey: String {
+    let genderName: String
+    switch gender {
+    case 1: genderName = "male"
+    case 2: genderName = "female"
+    case 3: genderName = "neutral"
+    default: genderName = "undefined"
+    }
+    return "\(voiceLanguage):\(technology):\(genderName):\(name):\(quality):\(version)"
+  }
+}
+
+// Subscribing is not a name lookup: the daemon matches the assetKey of the voice it is
+// handed, and a bare SynthesisVoice(language:name:) computes "en_US:undefined:undefined:
+// simone:undefined:0", which matches no asset, so the request succeeds and nothing is
+// downloaded. The mapping is Apple's own VoiceType numbering.
+func voiceType(forTechnology technology: String) -> Int? {
+  switch technology.lowercased() {
+  case "vocalizer": return 1
+  case "custom": return 2
+  case "gryphon": return 3
+  case "neural": return 4
+  case "neuralax": return 5
+  case "natural": return 6
+  default: return nil
+  }
+}
+
+// Returns nil rather than a voice that cannot match, so a caller reports the reason
+// instead of printing a request that will be ignored.
+func subscribableVoice(for asset: TTSAssetInfo) -> SynthesisVoice? {
+  guard let type = voiceType(forTechnology: asset.technology) else { return nil }
+  let voice = SynthesisVoice(language: asset.voiceLanguage, name: asset.name)
+  for (key, selector) in [("type", "setType:"), ("gender", "setGender:"), ("footprint", "setFootprint:")] {
+    guard voice.responds(to: NSSelectorFromString(selector)) else { return nil }
+    voice.setValue(key == "footprint" ? 2 : (key == "type" ? type : asset.gender), forKey: key)
+  }
+  voice.version = asset.version
+  guard voice.assetKey == asset.nativeAssetKey else { return nil }
+  return voice
 }
 
 private let siriFrameworkPath = "/System/Library/PrivateFrameworks/SiriTTSService.framework/SiriTTSService"
@@ -60,6 +113,13 @@ private func boolValue(_ object: AnyObject, _ name: String) -> Bool? {
   guard encoding(of: object, name) == "B16@0:8",
         let method = class_getInstanceMethod(type(of: object), NSSelectorFromString(name)) else { return nil }
   typealias Getter = @convention(c) (AnyObject, Selector) -> Bool
+  return unsafeBitCast(method_getImplementation(method), to: Getter.self)(object, NSSelectorFromString(name))
+}
+
+private func integerValue(_ object: AnyObject, _ name: String) -> Int? {
+  guard encoding(of: object, name) == "q16@0:8",
+        let method = class_getInstanceMethod(type(of: object), NSSelectorFromString(name)) else { return nil }
+  typealias Getter = @convention(c) (AnyObject, Selector) -> Int
   return unsafeBitCast(method_getImplementation(method), to: Getter.self)(object, NSSelectorFromString(name))
 }
 
@@ -116,6 +176,8 @@ func listCatalogAssets() throws -> [TTSAssetInfo] {
       language: language,
       technology: technology,
       quality: quality,
+      gender: integerValue(asset, "gender") ?? 0,
+      version: integerValue(asset, "versionNumber") ?? 0,
       downloadBytes: downloadBytes,
       diskBytes: diskBytes,
       locallyAvailable: boolValue(asset, "locallyAvailable") ?? false

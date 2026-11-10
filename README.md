@@ -27,6 +27,7 @@ friday voices                                   # installed voices
 friday voices --status simone                   # one voice in detail
 friday voices --available                       # all 149 assets Apple offers
 friday voices --install NAME --language en-GB --wait
+friday voices --install NAME --dry-run           # show the asset identity it would request
 friday voices --purge com.apple.siri.tts.voice.ar_SA.samer.neural.premium --dry-run
 friday config                                   # effective settings
 friday config set default-voice simone --standard
@@ -175,8 +176,10 @@ Xcode, only testing does. There is no CI: the audio checks need this machine.
   spends blocked — so a stop is noticed at the next 20 ms slice, not instantly.
 - `nora` clips on the standard path (1.17% of samples at full scale). `simone` and
   `Riya` are clean.
-- `voices --install` and `--purge --force` have not been exercised against a real
-  bundle.
+- `voices --purge --force` has not been exercised against a real bundle, and
+  `voices --install` has been verified up to the request: the rebuilt asset identity
+  matches Apple's own installed keys, but no transfer has been observed starting from it
+  in this repository's testing.
 - Premium Siri voices need the asset the daemon actually renders from. When it is
   missing the daemon substitutes its legacy voice and reports success, so friday checks
   the delivered rate and fails with exit 10 instead of speaking the wrong voice.

@@ -226,31 +226,48 @@ func runVoices(_ arguments: [String], config: FridayConfig) throws {
 
   case "install":
     guard let target else { throw FridayError.usage("--install needs a voice name") }
-    // A daemon record is not proof the voice renders: the asset the daemon needs can
-    // still be available-only, which is exactly the state that produces the legacy
-    // fallback. So an installable asset outweighs an existing record.
+    // A daemon record is not proof the voice renders: the asset the daemon needs can still
+    // be available-only, which is exactly the state that produces the legacy fallback. So
+    // an installable asset outweighs an existing record.
     let catalogued = (try? listCatalogAssets()) ?? []
     let installedSpecifiers = localAssetSpecifiers()
     let upgrade = installableAsset(for: target, in: catalogued, installed: installedSpecifiers)
-    if let existing = catalog.find(name: target), upgrade == nil {
+    let awaitedSpecifier = upgrade ?? (target.hasPrefix("com.apple.siri.tts.voice.") ? target : nil)
+    if awaitedSpecifier == nil, let existing = catalog.find(name: target) {
       print("already-installed\t\(existing.language)\t\(existing.name ?? "-")\t\(existing.assetKey)")
       return
     }
-    // "com.apple.siri.tts.voice.en_US.simone.natural.premium" -> "en_US"
-    let resolvedLanguage = language ?? upgrade?
-      .components(separatedBy: "voice.").last?
-      .split(separator: ".").first.map(String.init)
-    guard let resolvedLanguage else {
-      throw FridayError.usage("--install needs --language for a voice that is not installed yet, e.g. --language en-GB")
+
+    // The daemon matches a subscription on the assetKey of the voice it is handed, and a
+    // bare SynthesisVoice(language:name:) computes "en_US:undefined:undefined:…:0", which
+    // matches no asset: the request is accepted and nothing downloads. So the identity is
+    // rebuilt from the catalog record and verified before it goes out.
+    let record = awaitedSpecifier.flatMap { specifier in catalogued.first { $0.specifier == specifier } }
+      ?? catalogued.first { $0.specifier == target || $0.name.lowercased() == target.lowercased() }
+    let request: (voice: SynthesisVoice, name: String, specifier: String?, language: String)
+    if let record {
+      guard let voice = subscribableVoice(for: record) else {
+        throw FridayError.config(
+          "cannot build a subscription identity for \(record.specifier): technology '\(record.technology)' has no voice type; run 'friday voices --available'"
+        )
+      }
+      request = (voice, record.name, record.specifier, record.language)
+    } else {
+      // No usable catalog record (an older macOS, or a name only the daemon knows): the
+      // daemon's own request path, which needs a language and matches by name.
+      guard let language else {
+        throw FridayError.usage("--install needs --language for a voice that is not installed yet, e.g. --language en-GB")
+      }
+      request = (SynthesisVoice(language: language, name: target), target, nil, language)
     }
-    // Poll the asset store for the specifier when one is known: the daemon's voice list
-    // only changes after the asset lands, so waiting on names alone can never report
-    // progress and always ends in a timeout.
-    let awaitedSpecifier = upgrade ?? (target.hasPrefix("com.apple.siri.tts.voice.") ? target : nil)
-    let voice = SynthesisVoice(language: resolvedLanguage, name: awaitedSpecifier ?? target)
+    if dryRun {
+      print("would-request\t\(request.voice.assetKey)\t\(request.specifier ?? "-")")
+      return
+    }
+
     let subscribeDone = DispatchSemaphore(value: 0)
     var subscribeError: Error?
-    catalog.session.subscribe(voices: [voice]) { error in
+    catalog.session.subscribe(voices: [request.voice]) { error in
       subscribeError = error
       subscribeDone.signal()
     }
@@ -258,29 +275,30 @@ func runVoices(_ arguments: [String], config: FridayConfig) throws {
       throw FridayError.timeout(stage: "a voice download request", seconds: 30)
     }
     if let subscribeError { throw FridayError.synthesisFailed("\(subscribeError)") }
-    // The daemon accepts the request whether or not a transfer starts, so this says what
-    // was asked for and nothing about progress. The asset store is the only witness.
-    print("requested\t\(resolvedLanguage)\t\(target)\t(the daemon gives no progress; --wait polls the asset store)")
-    if let awaitedSpecifier, localAssetSpecifiers()[awaitedSpecifier] != nil {
-      print("installed\t\(awaitedSpecifier)")
+    // The daemon accepts the request whether or not a transfer starts, so this records the
+    // identity that was asked for — the part that used to be wrong — and claims nothing
+    // about progress. The asset store is the only witness.
+    print("requested\t\(request.language)\t\(request.name)\t\(request.voice.assetKey)")
+    if let specifier = request.specifier, localAssetSpecifiers()[specifier] != nil {
+      print("installed\t\(specifier)")
       return
     }
     guard waitForInstall else { return }
     let deadline = Date().addingTimeInterval(timeoutSeconds)
     while Date() < deadline {
-      if let awaitedSpecifier, localAssetSpecifiers()[awaitedSpecifier] != nil {
-        print("installed\t\(awaitedSpecifier)")
+      if let specifier = request.specifier, localAssetSpecifiers()[specifier] != nil {
+        print("installed\t\(specifier)")
         return
       }
-      if awaitedSpecifier == nil, catalog.refresh().contains(where: { ($0.name ?? "") == target }) {
-        print("installed\t\(resolvedLanguage)\t\(target)")
+      if request.specifier == nil, catalog.refresh().contains(where: { ($0.name ?? "") == request.name }) {
+        print("installed\t\(request.language)\t\(request.name)")
         return
       }
       Thread.sleep(forTimeInterval: 2)
     }
-    if let awaitedSpecifier {
+    if let specifier = request.specifier {
       throw FridayError.timeout(
-        stage: "'\(awaitedSpecifier)' to finish downloading (asset store still has it as \(localAssetSpecifiers()[awaitedSpecifier] == nil ? "not installed" : "installed"))",
+        stage: "'\(specifier)' to finish downloading (asset store: \(localAssetSpecifiers()[specifier] == nil ? "not installed" : "installed"))",
         seconds: timeoutSeconds
       )
     }

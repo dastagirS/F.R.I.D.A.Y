@@ -49,6 +49,16 @@ hand-written one containing only what this tool needs.
   render of the same text) — which is the family the user rejected by ear — and makes every
   en-GB voice fail with `FrontendOverrideAction: Cannot find resource asset`. The identity
   stays where it belongs: the expressive path.
+- Installing is not a name lookup. `subscribe(voices:)` matches the `assetKey` the daemon
+  computes for the voice it is handed, and `SynthesisVoice(language:name:)` on its own
+  computes `en_US:undefined:undefined:simone:undefined:0` — no asset, so the request is
+  accepted and nothing downloads. The identity has to be rebuilt from the catalog record:
+  technology as Apple's VoiceType number (vocalizer 1, custom 2, gryphon 3, neural 4,
+  neuralAX 5, natural 6), gender, footprint 2, and the asset's own version, then checked
+  against `nativeAssetKey` before sending. Two spellings matter: identities are hyphenated
+  (`en-IN:natural:female:Riya:premium:5049`, byte-identical to the key of the installed
+  en-IN Riya asset) and MobileAsset specifiers are underscored
+  (`…voice.en_IN.riya.natural.premium`). `voices --install --dry-run` prints the identity.
 - `subscribe(voices:)` returns without error whether or not a transfer starts, so
   `voices --install` cannot report progress and does not claim any; the asset store is the
   only witness, and `--wait` polls it by specifier. Before that, `--wait` polled the

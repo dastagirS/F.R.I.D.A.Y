@@ -75,6 +75,7 @@ friday voices — inspect and manage the Siri voice assets
   friday voices --status NAME                is this voice installed?
   friday voices --install NAME --language xx request a voice from Apple's catalog
   friday voices --install NAME --language xx --wait [--timeout SECONDS]
+  friday voices --install NAME|SPECIFIER [--dry-run]   show or send the request
   friday voices --available                  list Apple's downloadable catalog
   friday voices --purge NAME|SPECIFIER [--dry-run|--force]
                                              delete a local voice bundle;
