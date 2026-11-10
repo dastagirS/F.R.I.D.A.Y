@@ -191,6 +191,59 @@ final class ErrorTaxonomyTests: XCTestCase {
     XCTAssertEqual(asset.specifier, "com.apple.siri.tts.voice.en_IN.riya.natural.premium")
   }
 
+  // Three real states from this machine, checked without touching the asset store. The
+  // install offer must follow the asset store, not the daemon's inventory, and it must
+  // never propose a downgrade.
+  func testInstallOffersOnlyABetterAsset() {
+    func asset(_ specifier: String, _ technology: String, _ quality: String) -> TTSAssetInfo {
+      // com.apple.siri.tts.voice.<locale>.<name>.<technology>.<quality>
+      let parts = specifier.components(separatedBy: ".")
+      return TTSAssetInfo(
+        identifier: specifier, name: parts[6].capitalized, language: parts[5],
+        technology: technology, quality: quality, gender: 2, version: 0,
+        downloadBytes: 0, diskBytes: 0, locallyAvailable: false
+      )
+    }
+    let simone = [
+      asset("com.apple.siri.tts.voice.en_US.simone.natural.premium", "natural", "premium"),
+      asset("com.apple.siri.tts.voice.en_US.simone.neural.premium", "neural", "premium"),
+    ]
+    XCTAssertEqual(
+      installableAsset(
+        for: "Simone", in: simone,
+        installed: ["com.apple.siri.tts.voice.en_US.simone.neural.premium": "1"]
+      ),
+      "com.apple.siri.tts.voice.en_US.simone.natural.premium",
+      "the natural asset is the Siri path and must be offered over an installed neural one"
+    )
+
+    let riya = [
+      asset("com.apple.siri.tts.voice.en_IN.riya.natural.premium", "natural", "premium"),
+      asset("com.apple.siri.tts.voice.en_IN.riya.neural.premium", "neural", "premium"),
+    ]
+    XCTAssertNil(
+      installableAsset(
+        for: "Riya", in: riya,
+        installed: ["com.apple.siri.tts.voice.en_IN.riya.natural.premium": "1"]
+      ),
+      "a working voice must not be offered a 66 MB downgrade"
+    )
+
+    // Aman: premium is downloadable while only the compact quality is installed.
+    let aman = [
+      asset("com.apple.siri.tts.voice.en_IN.aman.neuralAX.premium", "neuralAX", "premium"),
+      asset("com.apple.siri.tts.voice.en_IN.aman.neuralAX.compact", "neuralAX", "compact"),
+    ]
+    XCTAssertEqual(
+      installableAsset(
+        for: "Aman", in: aman,
+        installed: ["com.apple.siri.tts.voice.en_IN.aman.neuralAX.compact": "1"]
+      ),
+      "com.apple.siri.tts.voice.en_IN.aman.neuralAX.premium",
+      "premium outranks compact within the same family"
+    )
+  }
+
   func testVoiceTypeMappingCoversTheCatalogFamilies() {
     XCTAssertEqual(voiceType(forTechnology: "natural"), 6)
     XCTAssertEqual(voiceType(forTechnology: "neural"), 4)

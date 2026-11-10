@@ -51,25 +51,42 @@ func runServe(_ arguments: [String], config: FridayConfig) throws -> Never {
 // standard path needs is still only downloadable — and that is the state that renders an
 // entirely different, legacy voice with no error at all.
 func reportAssetTruth(for voice: SynthesisVoice) {
-  let records = catalogRecords(for: voice, in: (try? listCatalogAssets()) ?? [])
+  let catalogued = (try? listCatalogAssets()) ?? []
+  let records = catalogRecords(for: voice, in: catalogued)
   guard !records.isEmpty else {
     print("assets\tnone\tthe asset catalog has no record for this voice")
     return
   }
   let installed = localAssetSpecifiers()
-  var naturalInstalled = false
+  var siriPathInstalled = false
   for record in records.sorted(by: { $0.technology < $1.technology }) {
+    // Same test as `--available`, so the two commands cannot disagree about what is
+    // present: the store's filesystem, or the asset object's own availability.
     let present = installed[record.specifier] != nil || record.locallyAvailable
-    // The family is the technology field; quality is "premium" for all of these.
-    if present, record.technology.lowercased() == "natural" { naturalInstalled = true }
+    if present, rendersOnSiriPath(technology: record.technology) { siriPathInstalled = true }
     print("assets\t\(present ? "installed" : "available")\t\(record.technology)/\(record.quality)\t\(record.specifier)")
   }
-  if naturalInstalled {
-    print("render\tsiri-path\tnatural asset installed; measured 48 kHz")
+  if siriPathInstalled {
+    print("render\tsiri-path\tan installed natural/neuralAX asset; measured 48 kHz")
   } else {
     print("render\tlegacy-fallback\tmeasured 22050 Hz: the daemon substitutes a different voice")
-    print("repair\tfriday voices --install \(voice.name ?? voice.assetKey) --language \(voice.language) --wait")
-    print("repair\tSystem Settings > Accessibility > Spoken Content > Manage Voices (same asset)")
+  }
+  // Offered independently of the verdict: a voice can render and still be missing the
+  // asset family worth having.
+  if let better = installableAsset(for: voice.name ?? voice.assetKey, in: catalogued, installed: installed) {
+    print("better\t\(better)")
+    print("upgrade\tfriday voices --install \(voice.name ?? voice.assetKey) --language \(voice.language) --wait")
+  }
+}
+
+// Which installed families the standard path actually renders, measured on macOS 27.2:
+// natural → 48 kHz, neuralAX → 48 kHz. A neural asset alone renders at 24 kHz and only
+// behind the expressive client identity, and no matching asset at all means the daemon
+// substitutes its legacy 22.05 kHz voice.
+func rendersOnSiriPath(technology: String) -> Bool {
+  switch technology.lowercased() {
+  case "natural", "neuralax": return true
+  default: return false
   }
 }
 
@@ -90,24 +107,30 @@ func installableAsset(for target: String, in assets: [TTSAssetInfo], installed: 
     let lowered = target.lowercased()
     matches = assets.filter { $0.name.lowercased() == lowered }
   }
-  func rank(_ technology: String) -> Int {
-    switch technology.lowercased() {
-    case "natural": return 2
-    case "neural": return 1
-    default: return 0
-    }
-  }
   // Only an improvement counts. Riya has its natural asset installed and a neural one on
   // offer; prompting a 66 MB download for an asset the standard path renders worse would
-  // be a regression dressed up as a repair.
+  // be a regression dressed up as a repair. Installedness comes from the asset store, not
+  // from the daemon's inventory, which can still list a voice whose asset was eliminated.
   let installedBest = matches
-    .filter { installed[$0.specifier] != nil || $0.locallyAvailable }
-    .map { rank($0.technology) }
+    .filter { installed[$0.specifier] != nil }
+    .map { assetPreference(technology: $0.technology, quality: $0.quality) }
     .max() ?? -1
   return matches
-    .filter { installed[$0.specifier] == nil && !$0.locallyAvailable && rank($0.technology) > installedBest }
-    .max { rank($0.technology) < rank($1.technology) }?
+    .filter {
+      installed[$0.specifier] == nil
+        && assetPreference(technology: $0.technology, quality: $0.quality) > installedBest
+    }
+    .max { assetPreference(technology: $0.technology, quality: $0.quality)
+      < assetPreference(technology: $1.technology, quality: $1.quality) }?
     .specifier
+}
+
+// Apple's voice types in their own order, so a better family is a better asset; premium
+// breaks ties against compact. Measured on this machine: natural and neuralAX render at
+// 48 kHz on the standard path, neural at 24 kHz only behind the expressive client identity,
+// and anything matching no asset at all falls back to the legacy 22.05 kHz voice.
+func assetPreference(technology: String, quality: String) -> Int {
+  (voiceType(forTechnology: technology) ?? 0) * 10 + (quality.lowercased() == "premium" ? 1 : 0)
 }
 
 func runVoices(_ arguments: [String], config: FridayConfig) throws {
@@ -217,12 +240,18 @@ func runVoices(_ arguments: [String], config: FridayConfig) throws {
       return
     }
     try eliminateAsset(specifier: specifier)
-    if localAssetSpecifiers()[specifier] == nil {
-      print("removed\t\(specifier)")
-    } else {
-      print("still-present\t\(specifier)")
-      throw FridayError.config("elimination did not remove the asset; the filesystem is the source of truth")
+    // Elimination is routed to mobileassetd and completes asynchronously: measured at ~20 s
+    // for a 33 MB voice asset. Checking the filesystem once, immediately, reported success
+    // as a failure and told the user the filesystem disagreed with itself.
+    let removalDeadline = Date().addingTimeInterval(60)
+    while localAssetSpecifiers()[specifier] != nil {
+      guard Date() < removalDeadline else {
+        print("still-present\t\(specifier)")
+        throw FridayError.config("elimination did not remove the asset within 60s; the filesystem is the source of truth")
+      }
+      Thread.sleep(forTimeInterval: 1)
     }
+    print("removed\t\(specifier)")
 
   case "install":
     guard let target else { throw FridayError.usage("--install needs a voice name") }

@@ -176,10 +176,9 @@ Xcode, only testing does. There is no CI: the audio checks need this machine.
   spends blocked — so a stop is noticed at the next 20 ms slice, not instantly.
 - `nora` clips on the standard path (1.17% of samples at full scale). `simone` and
   `Riya` are clean.
-- `voices --purge --force` has not been exercised against a real bundle, and
-  `voices --install` has been verified up to the request: the rebuilt asset identity
-  matches Apple's own installed keys, but no transfer has been observed starting from it
-  in this repository's testing.
+- `voices --install`/`--purge` were exercised against a real 33 MB bundle: the download
+  completed in ~12 s and the voice appeared in the daemon inventory, and elimination took
+  ~20 s to land on disk, so `--purge` polls for it rather than checking once.
 - Premium Siri voices need the asset the daemon actually renders from. When it is
   missing the daemon substitutes its legacy voice and reports success, so friday checks
   the delivered rate and fails with exit 10 instead of speaking the wrong voice.

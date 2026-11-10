@@ -58,7 +58,14 @@ hand-written one containing only what this tool needs.
   against `nativeAssetKey` before sending. Two spellings matter: identities are hyphenated
   (`en-IN:natural:female:Riya:premium:5049`, byte-identical to the key of the installed
   en-IN Riya asset) and MobileAsset specifiers are underscored
-  (`…voice.en_IN.riya.natural.premium`). `voices --install --dry-run` prints the identity.
+  (`…voice.en_IN.riya.natural.premium`). `voices --install --dry-run` prints the identity. Measured end to end with the 33 MB
+  en-IN Aman `neuralAX` premium asset: subscribe → installed in ~12 s, and the voice then
+  rendered at 48 kHz on the standard path, so `neuralAX` is a Siri-path family alongside
+  `natural` (a `neural` asset alone is not). Elimination is routed through mobileassetd and
+  is asynchronous — ~20 s before the bundle leaves the asset root — so `--purge` polls for
+  up to 60 s; checking once, immediately, reported a successful purge as a failure. A
+  purged voice also stays in the daemon's inventory until that refreshes, so "already
+  installed" is decided by the asset store, not by the daemon's list.
 - `subscribe(voices:)` returns without error whether or not a transfer starts, so
   `voices --install` cannot report progress and does not claim any; the asset store is the
   only witness, and `--wait` polls it by specifier. Before that, `--wait` polled the
